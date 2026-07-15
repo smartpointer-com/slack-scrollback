@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "slack-scrollback"
+version = "0.1.0"
+description = "Read-only Slack history and search for LLM agents, over a bot token, as deterministic CLI calls."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "SmartPointer AG" }]
+keywords = ["slack", "history", "search", "cli", "llm", "agent", "read-only"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Communications :: Chat",
+]
+
+# Deliberately empty: the runtime is stdlib-only (urllib). Keeping it that way
+# means the venv is reproducible from Python alone and the HTTP layer stays
+# small enough to audit against the read-only method allowlist.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "ruff==0.15.21",
+  "mypy==2.3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/smartpointer/slack-scrollback"
+Issues = "https://github.com/smartpointer/slack-scrollback/issues"
+
+[project.scripts]
+slack-scrollback = "slack_scrollback.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slack_scrollback"]
+
+[tool.ruff]
+# Roomier than the usual 88/100: this tool's error strings are whole sentences
+# telling the reader what to run next, and chopping them into fragments to fit a
+# column makes them harder to read in the source than they are in a terminal.
+line-length = 120
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

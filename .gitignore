@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Local config — never commit a real token
+slack-scrollback.cfg
+*.local.cfg
+.env
+
+# OS
+.DS_Store
