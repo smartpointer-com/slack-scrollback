@@ -17,3 +17,6 @@ slack-scrollback.cfg
 
 # OS
 .DS_Store
+
+# Build artifact: a single-file zipapp produced by `make build`.
+/slack-scrollback

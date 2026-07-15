@@ -31,14 +31,49 @@ $ slack-scrollback history '#general' --since today
 ## Install
 
 ```sh
-make install     # creates .venv and installs the package plus dev tooling
-make all         # install + lint + test
+make build          # produces ./slack-scrollback — one self-contained file
+./slack-scrollback channels
 ```
 
-The CLI lands at `.venv/bin/slack-scrollback`. Put it on `PATH` however suits
-you — a symlink into `~/.local/bin`, a shell alias, or by calling the full path.
+That artifact is the whole tool: a stdlib [zipapp](https://docs.python.org/3/library/zipapp.html),
+about 80 KB, with no dependencies to resolve. **It installs by being copied.**
 
-`make` is the only entry point: `install`, `lint`, `test`, `fmt`, `clean`, `all`.
+```sh
+cp slack-scrollback ~/.local/bin/          # or anywhere on PATH
+scp slack-scrollback other-host:/usr/local/bin/
+```
+
+No clone, no venv, no `pip`, no container on the target — only a `python3` of
+3.11 or newer.
+
+### The shebang, if the target's python3 is old
+
+The artifact ships `#!/usr/bin/env python3`, which resolves to whatever `python3`
+comes first on the *running user's* `PATH`. On macOS that is `/usr/bin/python3`,
+still 3.9, and the tool refuses to run on it — loudly, naming the fix, rather
+than misbehaving. Two ways out:
+
+```sh
+# Bake a known-good interpreter into the copy you distribute:
+make build PYTHON_SHEBANG=/opt/homebrew/bin/python3
+
+# …or just call it with one:
+/opt/homebrew/bin/python3 slack-scrollback channels
+```
+
+This matters when the tool is installed for a *different* user — a service
+account or daemon — whose `PATH` is not yours.
+
+### Working on the tool
+
+```sh
+make install     # creates .venv and installs the package plus pinned dev tools
+make all         # install + lint + test + build
+```
+
+`make` is the only entry point: `install`, `build`, `lint`, `test`, `fmt`,
+`clean`, `all`. During development `.venv/bin/slack-scrollback` runs the code in
+place, without rebuilding.
 
 ## Set up the Slack app
 
