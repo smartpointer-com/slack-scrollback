@@ -111,10 +111,36 @@ export SLACK_BOT_TOKEN=xoxb-your-token              # environment
 echo 'SLACK_BOT_TOKEN=xoxb-your-token' > ~/.config/slack-scrollback.cfg
 ```
 
-The config file is one `KEY=VALUE` per line. A line whose first non-blank
-character is `#` is a comment; `#` elsewhere is part of the value. It is data,
-not a shell fragment: no interpolation, no `export`, no substitution, so a value
-like `$HOME` stays those five characters. Point elsewhere with `--config PATH`.
+With no `--config`, two locations are tried in order, and the first that exists
+wins:
+
+| Path | For |
+|---|---|
+| `~/.config/slack-scrollback.cfg` | the conventional home for configuration |
+| `~/.secrets/slack-scrollback.env` | the habit of keeping credentials in one narrowly-permissioned directory |
+
+`$SLACK_SCROLLBACK_CONFIG` overrides both, as does `--config PATH`.
+
+The file is one `KEY=VALUE` per line. A line whose first non-blank character is
+`#` is a comment; `#` elsewhere is part of the value. It is data, not a shell
+fragment: no interpolation, no `export`, no substitution, so a value like `$HOME`
+stays those five characters.
+
+#### A token that already lives somewhere else
+
+If the token is already held by another tool — a secret store, a password
+manager's export, a provisioning artefact — name that file instead of copying out
+of it. A copy is not merely untidy: it goes stale the moment the token is
+rotated, and silently.
+
+```sh
+# ~/.config/slack-scrollback.cfg — holds a path, not a credential
+SLACK_BOT_TOKEN_JSON_PATH=/path/to/secrets.json
+```
+
+Any JSON object with a top-level `slack_bot_token` string works; nothing else in
+the file is read. `$SLACK_BOT_TOKEN_JSON_PATH` does the same from the
+environment. It is consulted last, so an explicit token always wins.
 
 The token is sent in an `Authorization` header and never appears in output, logs,
 or error messages — including when the config file itself is malformed, where the

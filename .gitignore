@@ -12,6 +12,7 @@ build/
 
 # Local config — never commit a real token
 slack-scrollback.cfg
+slack-scrollback.env
 *.local.cfg
 .env
 

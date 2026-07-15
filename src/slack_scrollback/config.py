@@ -1,31 +1,68 @@
 """Token resolution.
 
-Precedence is ``--token``, then ``$SLACK_BOT_TOKEN``, then the config file.
+Precedence is ``--token``, then ``$SLACK_BOT_TOKEN``, then ``SLACK_BOT_TOKEN``
+in the config file, and finally a JSON file named by ``SLACK_BOT_TOKEN_JSON_PATH``.
 Flags carry the value itself rather than the name of an environment variable to
 read: one indirection is confusing, and the shell already offers ``$VAR``.
+
+The JSON step exists so a token that already lives in some other tool's secret
+store does not have to be copied here. A second copy is not merely untidy: it
+goes stale the moment the token is rotated, and does so silently. Naming the file
+rather than knowing about any particular one keeps that generic — a password
+manager's export, an agent framework's secret store, a provisioning artefact all
+work the same way, and this tool learns nothing about any of them.
 """
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 from .errors import ConfigError
 
 ENV_TOKEN = "SLACK_BOT_TOKEN"
+ENV_TOKEN_JSON = "SLACK_BOT_TOKEN_JSON_PATH"
 CONFIG_ENV = "SLACK_SCROLLBACK_CONFIG"
 CONFIG_KEY = "SLACK_BOT_TOKEN"
+CONFIG_KEY_JSON = "SLACK_BOT_TOKEN_JSON_PATH"
+
+#: The field read from that JSON file. Fixed rather than configurable: one knob
+#: is a fallback, two are a query language.
+JSON_FIELD = "slack_bot_token"
 
 BOT_TOKEN_PREFIX = "xoxb-"
 USER_TOKEN_PREFIX = "xoxp-"
 
 
-def default_config_path() -> Path:
-    """Where the config file lives when ``--config`` is not given."""
-    override = os.environ.get(CONFIG_ENV)
+def config_candidates(environ: Mapping[str, str] | None = None) -> list[Path]:
+    """The config files looked for, in order, when ``--config`` is not given.
+
+    Two locations, because a token is not ordinary configuration. ``~/.config``
+    is the conventional home and comes first; ``~/.secrets`` is the common habit
+    of keeping credentials in one narrowly-permissioned directory, separate from
+    settings that are safe to read, sync, or commit. Supporting both costs a
+    stat() and saves everyone whose secrets already live apart from their config.
+    """
+    env = os.environ if environ is None else environ
+    override = env.get(CONFIG_ENV)
     if override:
-        return Path(override)
-    return Path(os.path.expanduser("~")) / ".config" / "slack-scrollback.cfg"
+        return [Path(override)]
+    home = Path(os.path.expanduser("~"))
+    return [
+        home / ".config" / "slack-scrollback.cfg",
+        home / ".secrets" / "slack-scrollback.env",
+    ]
+
+
+def default_config_path(environ: Mapping[str, str] | None = None) -> Path:
+    """The first config file that exists, or the conventional one to create."""
+    candidates = config_candidates(environ)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
 
 
 def parse_config(text: str) -> dict[str, str]:
@@ -92,15 +129,51 @@ def _validate(token: str, source: str) -> str:
     return token
 
 
+def token_from_json(path: Path, *, source: str) -> str:
+    """Read the bot token out of a JSON file's ``slack_bot_token`` field.
+
+    Every failure names the file and the field, because this path is reached
+    precisely when someone has pointed the tool at a store it did not write and
+    cannot guess the shape of.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"{source} points at {path}, which does not exist") from exc
+    except PermissionError as exc:
+        raise ConfigError(
+            f"{source} points at {path}, which this user cannot read — check its ownership and mode"
+        ) from exc
+    except OSError as exc:
+        raise ConfigError(f"{source} points at {path}, which cannot be read: {exc.strerror}") from exc
+
+    try:
+        document = json.loads(text)
+    except ValueError as exc:
+        raise ConfigError(f"{source} points at {path}, which is not valid JSON") from exc
+
+    if not isinstance(document, dict):
+        raise ConfigError(f"{path} does not hold a JSON object, so it has no '{JSON_FIELD}' field")
+
+    value = document.get(JSON_FIELD)
+    if value is None:
+        raise ConfigError(
+            f"{path} has no '{JSON_FIELD}' field — add one, or point {ENV_TOKEN_JSON} at a file that has it"
+        )
+    if not isinstance(value, str):
+        raise ConfigError(f"the '{JSON_FIELD}' field in {path} is a {type(value).__name__}, not a string")
+    return _validate(value, f"the '{JSON_FIELD}' field in {path}")
+
+
 def resolve_token(
     *,
     flag: str | None = None,
     config_path: Path | None = None,
-    environ: dict[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> str:
     """Find the bot token, or explain precisely how to supply one."""
     env = os.environ if environ is None else environ
-    path = config_path or default_config_path()
+    path = config_path or default_config_path(env)
 
     if flag:
         return _validate(flag, "--token")
@@ -114,8 +187,18 @@ def resolve_token(
     if from_file:
         return _validate(from_file, f"{CONFIG_KEY} in {path}")
 
+    # Last: a token held in someone else's store, named rather than copied.
+    json_env = env.get(ENV_TOKEN_JSON)
+    if json_env:
+        return token_from_json(Path(json_env), source=f"${ENV_TOKEN_JSON}")
+    json_cfg = config.get(CONFIG_KEY_JSON)
+    if json_cfg:
+        return token_from_json(Path(json_cfg), source=f"{CONFIG_KEY_JSON} in {path}")
+
     raise ConfigError(
         f"no Slack bot token found — supply one with '--token xoxb-...', "
         f"or export {ENV_TOKEN}=xoxb-..., "
-        f"or write '{CONFIG_KEY}=xoxb-...' into {path}"
+        f"or write '{CONFIG_KEY}=xoxb-...' into {path}, "
+        f"or point it at a JSON file holding a '{JSON_FIELD}' field with "
+        f"'{CONFIG_KEY_JSON}=/path/to/secrets.json'"
     )
