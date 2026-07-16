@@ -23,6 +23,24 @@ from slack_scrollback.workspace import Conversation, Workspace
 TOKEN = "xoxb-0000-test-token-not-real"
 
 
+@pytest.fixture(autouse=True)
+def _nothing_real_is_readable(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """No test may see this machine's real config, token, or archive.
+
+    The archive made this load-bearing: `search` silently prefers an archive
+    when one exists, and `resolve_archive_dir` falls through env and config to
+    a real home-directory default — so an unscrubbed test would change
+    behaviour on any machine that actually uses the tool. Tests that need one
+    of these set their own value on top; explicit `environ=` arguments in
+    unit tests are unaffected.
+    """
+    private = tmp_path_factory.mktemp("isolation")
+    monkeypatch.setenv("SLACK_SCROLLBACK_CONFIG", str(private / "no-such-config.cfg"))
+    monkeypatch.setenv("SLACK_SCROLLBACK_ARCHIVE_DIR", str(private / "no-such-archive"))
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN_JSON_PATH", raising=False)
+
+
 @dataclass
 class Call:
     """One request the client tried to make."""
@@ -149,3 +167,160 @@ def workspace_factory() -> Callable[[dict[str, Handler]], tuple[Workspace, FakeT
         return Workspace(client), transport
 
     return build
+
+
+# -- sync fixtures -----------------------------------------------------------
+#
+# Sync tests drive a mutable in-memory "workspace": set up channels, messages
+# and threads; run a sync; mutate; run again. The clock is injected, so tests
+# choose their own "now" and windows are deterministic.
+
+#: A fixed, readable "now" for sync tests: far enough from every message that
+#: tests place their own timestamps relative to it.
+NOW = 1_700_000_000.0
+
+
+def ts_at(offset: float) -> str:
+    """A Slack ts ``offset`` seconds after the fixture epoch (NOW - 30 days)."""
+    return f"{NOW - 30 * 86400 + offset:.6f}"
+
+
+def thread_parent(ts: str, *, reply_count: int, latest_reply: str, **extra: Any) -> dict[str, Any]:
+    return message(ts, thread_ts=ts, reply_count=reply_count, latest_reply=latest_reply, **extra)
+
+
+def thread_reply(parent_ts: str, ts: str, text: str = "a reply", **extra: Any) -> dict[str, Any]:
+    return message(ts, text=text, thread_ts=parent_ts, **extra)
+
+
+def slack_file(
+    file_id: str = "F0EXAMPLE1",
+    name: str = "plan.pdf",
+    mimetype: str = "application/pdf",
+    size: int = 6,
+    mode: str = "hosted",
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "id": file_id,
+        "name": name,
+        "mimetype": mimetype,
+        "filetype": name.rsplit(".", 1)[-1],
+        "size": size,
+        "mode": mode,
+        "permalink": f"https://acme.slack.com/files/U0EXAMPLE1/{file_id}/{name}",
+        "url_private": f"https://files.slack.com/files-pri/T0EXAMPLE1-{file_id}/{name}",
+        **extra,
+    }
+
+
+@dataclass
+class FakeSlack:
+    """A mutable in-memory workspace answering the read-only Slack methods.
+
+    ``messages`` holds each conversation's channel-level messages (thread
+    parents included, replies not — exactly what ``conversations.history``
+    serves); ``threads`` holds replies keyed by ``(channel_id, thread_ts)``.
+    Deleting from either simulates a Slack-side deletion.
+    """
+
+    channels: list[dict[str, Any]] = field(default_factory=lambda: [channel()])
+    messages: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    threads: dict[tuple[str, str], list[dict[str, Any]]] = field(default_factory=dict)
+    users: dict[str, str] = field(default_factory=lambda: {"U0EXAMPLE1": "alice", "U0EXAMPLE2": "bob"})
+    team_url: str = "https://acme.slack.com"
+
+    def handlers(self) -> dict[str, Handler]:
+        return {
+            "auth.test": lambda params: ok(url=f"{self.team_url}/", team_id="T0EXAMPLE1"),
+            "conversations.list": lambda params: ok(channels=self.channels),
+            "conversations.history": self._history,
+            "conversations.replies": self._replies,
+            "users.info": self._user_info,
+            "conversations.info": lambda params: err("channel_not_found"),
+        }
+
+    def _history(self, params: dict[str, str]) -> dict[str, Any]:
+        oldest = float(params.get("oldest", "0"))
+        latest = float(params.get("latest", "9999999999"))
+        found = [m for m in self.messages.get(params.get("channel", ""), []) if oldest <= float(str(m["ts"])) <= latest]
+        found.sort(key=lambda m: float(str(m["ts"])), reverse=True)
+        return ok(messages=found, has_more=False)
+
+    def _replies(self, params: dict[str, str]) -> dict[str, Any]:
+        channel_id, thread_ts = params.get("channel", ""), params.get("ts", "")
+        parent = next((m for m in self.messages.get(channel_id, []) if str(m["ts"]) == thread_ts), None)
+        replies = self.threads.get((channel_id, thread_ts), [])
+        if parent is None:
+            return err("thread_not_found")
+        ordered = sorted(replies, key=lambda m: float(str(m["ts"])))
+        return ok(messages=[parent, *ordered], has_more=False)
+
+    def _user_info(self, params: dict[str, str]) -> dict[str, Any]:
+        user_id = params.get("user", "")
+        if user_id not in self.users:
+            return err("user_not_found")
+        return ok(user={"id": user_id, "profile": {"display_name": self.users[user_id]}})
+
+
+@dataclass
+class FakeFileHost:
+    """Answers media downloads from a canned URL table, recording each request."""
+
+    responses: dict[str, Handler] = field(default_factory=dict)
+    calls: list[Call] = field(default_factory=list)
+
+    def __call__(self, url: str, headers: Mapping[str, str], timeout: float) -> HttpResponse:
+        self.calls.append(Call(method="GET", params={}, headers=dict(headers), url=url))
+        if url not in self.responses:
+            raise AssertionError(f"test did not stub download URL {url!r}")
+        result = self.responses[url]
+        if callable(result):
+            result = result({})
+        if isinstance(result, HttpResponse):
+            return result
+        raise AssertionError(f"download stub for {url!r} must be an HttpResponse")
+
+
+def file_body(payload: bytes, content_type: str = "application/pdf") -> HttpResponse:
+    return HttpResponse(status=200, headers={"content-type": content_type}, body=payload)
+
+
+def run_sync(
+    fake: FakeSlack,
+    archive_dir: Any,
+    *,
+    full: bool = False,
+    now: float = NOW,
+    recheck_seconds: float = 7 * 86400.0,
+    media_tiers: frozenset[str] = frozenset(),
+    media_max_bytes: int | None = None,
+    downloads: FakeFileHost | None = None,
+) -> tuple[Any, Any, FakeTransport]:
+    """One sync run; returns ``(report, archive, transport)``.
+
+    The archive connection is left open for assertions. Call again with the
+    same directory (after mutating ``fake``) for an incremental follow-up run.
+    """
+    from pathlib import Path
+
+    from slack_scrollback.archive import Archive
+    from slack_scrollback.syncer import Syncer
+
+    client, transport = make_client(fake.handlers())
+    workspace = Workspace(client)
+    archive = Archive.open_rw(Path(archive_dir))
+    syncer = Syncer(
+        workspace,
+        client,
+        archive,
+        token=TOKEN,
+        full=full,
+        recheck_seconds=recheck_seconds,
+        media_tiers=media_tiers,
+        media_max_bytes=media_max_bytes,
+        now_fn=lambda: now,
+        download_transport=downloads,
+    )
+    report = syncer.run()
+    return report, archive, transport

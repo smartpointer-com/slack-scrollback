@@ -1,6 +1,6 @@
 ---
 name: slack-scrollback
-description: Reads and searches Slack history — channels, DMs, and threads — with the read-only slack-scrollback CLI. Use when asked what was said in a Slack channel, what happened on Slack today, to find Slack messages about a topic, what someone said on Slack, or to summarize a Slack thread.
+description: Reads and searches Slack history — channels, DMs, and threads — with the read-only slack-scrollback CLI. Use when asked what was said in a Slack channel, what happened on Slack today, to find Slack messages about a topic, what someone said on Slack, to summarize a Slack thread, or to open a file shared on Slack.
 ---
 
 # Slack history and search (read-only)
@@ -8,7 +8,7 @@ description: Reads and searches Slack history — channels, DMs, and threads —
 `slack-scrollback` reads Slack. It cannot post, edit, react, or delete —
 attempting to is refused in code, so there is no way to change anything.
 
-Four commands. Each one answers a whole question in a single call. Never chain
+Five commands. Each one answers a whole question in a single call. Never chain
 two commands when one will do.
 
 | The request | The command |
@@ -22,6 +22,7 @@ two commands when one will do.
 | "summarize this thread: <permalink>" | `slack-scrollback thread '<permalink>'` |
 | "what channels are there?" / "what can you see?" | `slack-scrollback channels` |
 | "what did Alice say in her DM?" | `slack-scrollback history '@alice' --since 7d` |
+| "read the PDF Alice shared" | `slack-scrollback file '<file permalink>'`, then open the printed path |
 
 **Always put the channel name in single quotes.** A shell treats a bare
 `#general` as a comment and throws the argument away. `'#general'` and
@@ -107,6 +108,26 @@ CHANNEL     KIND       MEMBERS  LAST ACTIVITY        ID
 Most recently active first. Run this when a channel name is not recognised, or
 to answer "what can you see?".
 
+### Get a file someone shared
+
+```sh
+slack-scrollback file 'https://acme.slack.com/files/U0EXAMPLE1/F0EXAMPLE1/plan.pdf'
+```
+```
+/home/user/.local/share/slack-scrollback/media/F0EXAMPLE1/plan.pdf
+name: plan.pdf
+mimetype: application/pdf
+size: 3700842
+source: archive
+```
+The first line is a local path — read or open that file; do not try to fetch
+the URL yourself. The command accepts a file ID (`F0EXAMPLE1`) or any Slack
+file link, including the permalinks that `--links` appends after `[file: ...]`
+markers. When it says `source: live` the file was downloaded to the current
+directory; pass `--out` with a directory to put it somewhere else. If the file
+lives outside Slack (a Google Docs share), the error names the real URL —
+pass that on instead.
+
 ## Rules
 
 - **Quote channel names**: `'#general'`, not `#general`.
@@ -128,6 +149,9 @@ Errors say what to do next. Follow them literally.
 | `the bot can see #x but is not a member` | It cannot be read. Tell the person to invite the bot: `/invite @bot` in that channel |
 | `no Slack bot token found` | Not configured. Say so — do not guess a token |
 | `the Slack app is missing the 'x' scope` | Report the named scope to the person; it needs adding in Slack |
+| `no archive found at ...` | Drop `--archive` and re-run (the command works live), and mention the archive is not set up |
+| `file F... is not in the archive` | The file has not been archived yet — say so; the next sync picks it up |
+| `... lives outside Slack (mode: external)` | The file is a Google-Docs-style link; give the person the URL the error names |
 
 ## Every flag there is
 
@@ -141,13 +165,19 @@ That is the whole list — there are no others to guess at.
 | `--in CHANNEL` | `search` | search one conversation instead of all |
 | `--from NAME` | `search` | only messages by that person |
 | `--no-threads` | `history` | skip thread replies |
-| `--no-activity` | `channels` | skip the last-activity lookup (faster) |
+| `--no-activity` | `channels` | skip the last-activity column |
+| `--live` | `channels`, `history`, `thread`, `search`, `file` | ask Slack directly, never the local archive |
+| `--archive` | `channels`, `history`, `thread`, `search` | answer from the local archive only, no network |
+| `--out PATH` | `file` | where a fresh download lands (default: current directory) |
 | `--json` | all | one JSON object per line |
-| `--links` | all | append each message's permalink |
+| `--links` | `channels`, `history`, `thread`, `search` | append each message's (and file's) permalink |
 
 ## Good to know
 
 - Times are local and messages come oldest first, so the last line is the newest.
 - The bot only sees conversations it was invited to. "Not in `channels`" means
   invisible, not non-existent. It reads its own DMs, not other people's.
-- Nothing is stored between calls — every run reads Slack fresh.
+- Some answers come from a local archive and end with
+  `[from local archive, synced ...]`. That is normal — `search` prefers the
+  archive because it covers the whole history. Only add `--live` when asked
+  for the absolutely latest state of Slack.

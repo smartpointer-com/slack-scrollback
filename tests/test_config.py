@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -274,3 +275,92 @@ def test_the_format_is_data_not_shell() -> None:
     """No interpolation, no export, no substitution — the value is taken literally."""
     parsed = parse_config("K=$HOME/x\nJ=`whoami`\nL=${OTHER}\n")
     assert parsed == {"K": "$HOME/x", "J": "`whoami`", "L": "${OTHER}"}
+
+
+# -- the archive directory and media settings ---------------------------------
+
+
+class TestResolveArchiveDir:
+    """Precedence must mirror the token's: flag, env, config file, default."""
+
+    def test_flag_wins_over_everything(self, tmp_path: Path) -> None:
+        from slack_scrollback.config import resolve_archive_dir
+
+        cfg = _cfg(tmp_path, "ARCHIVE_DIR=/from/config")
+        env = {"SLACK_SCROLLBACK_ARCHIVE_DIR": "/from/env"}
+        assert resolve_archive_dir(flag="/from/flag", config_path=cfg, environ=env) == Path("/from/flag")
+
+    def test_env_beats_the_config_file(self, tmp_path: Path) -> None:
+        from slack_scrollback.config import resolve_archive_dir
+
+        cfg = _cfg(tmp_path, "ARCHIVE_DIR=/from/config")
+        env = {"SLACK_SCROLLBACK_ARCHIVE_DIR": "/from/env"}
+        assert resolve_archive_dir(config_path=cfg, environ=env) == Path("/from/env")
+
+    def test_config_file_beats_the_default(self, tmp_path: Path) -> None:
+        from slack_scrollback.config import resolve_archive_dir
+
+        cfg = _cfg(tmp_path, "ARCHIVE_DIR=/from/config")
+        assert resolve_archive_dir(config_path=cfg, environ={}) == Path("/from/config")
+
+    def test_default_is_the_xdg_data_location(self, tmp_path: Path) -> None:
+        from slack_scrollback.config import resolve_archive_dir
+
+        cfg = tmp_path / "missing.cfg"
+        resolved = resolve_archive_dir(config_path=cfg, environ={})
+        assert resolved == Path(os.path.expanduser("~")) / ".local" / "share" / "slack-scrollback"
+
+    def test_tilde_in_any_source_is_expanded(self, tmp_path: Path) -> None:
+        from slack_scrollback.config import resolve_archive_dir
+
+        resolved = resolve_archive_dir(flag="~/somewhere", config_path=tmp_path / "n.cfg", environ={})
+        assert "~" not in str(resolved)
+
+
+class TestResolveMediaSettings:
+    def _resolve(self, tmp_path: Path, text: str = "", **kwargs: Any) -> tuple[frozenset[str], int | None]:
+        from slack_scrollback.config import resolve_media_settings
+
+        cfg = _cfg(tmp_path, text) if text else tmp_path / "missing.cfg"
+        return resolve_media_settings(config_path=cfg, environ={}, **kwargs)
+
+    def test_defaults_are_documents_and_images_with_no_size_cap(self, tmp_path: Path) -> None:
+        """The tier list is the safety valve; an unset cap means 'archive what was shared'."""
+        tiers, cap = self._resolve(tmp_path)
+        assert tiers == frozenset({"documents", "images"})
+        assert cap is None
+
+    def test_zero_means_uncapped_and_overrides_a_config_cap(self, tmp_path: Path) -> None:
+        _, cap = self._resolve(tmp_path, "MEDIA_MAX_BYTES=1024", max_bytes_flag=0)
+        assert cap is None
+        _, cap = self._resolve(tmp_path, "MEDIA_MAX_BYTES=0")
+        assert cap is None
+
+    def test_flag_beats_config_file(self, tmp_path: Path) -> None:
+        tiers, cap = self._resolve(
+            tmp_path, "MEDIA_TIERS=video\nMEDIA_MAX_BYTES=1", tiers_flag="audio", max_bytes_flag=99
+        )
+        assert tiers == frozenset({"audio"})
+        assert cap == 99
+
+    def test_config_file_supplies_both(self, tmp_path: Path) -> None:
+        tiers, cap = self._resolve(tmp_path, "MEDIA_TIERS=documents,images,video\nMEDIA_MAX_BYTES=1024")
+        assert tiers == frozenset({"documents", "images", "video"})
+        assert cap == 1024
+
+    def test_none_disables_downloads(self, tmp_path: Path) -> None:
+        tiers, _ = self._resolve(tmp_path, tiers_flag="none")
+        assert tiers == frozenset()
+
+    def test_unknown_tier_is_refused_naming_the_valid_ones(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError) as excinfo:
+            self._resolve(tmp_path, tiers_flag="documents,movies")
+        assert "documents, images, audio, video" in str(excinfo.value)
+
+    def test_non_numeric_max_bytes_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError):
+            self._resolve(tmp_path, "MEDIA_MAX_BYTES=fifty megabytes")
+
+    def test_negative_max_bytes_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError):
+            self._resolve(tmp_path, max_bytes_flag=-1)

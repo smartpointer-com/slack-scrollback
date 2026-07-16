@@ -83,9 +83,11 @@ def test_every_command_in_the_readme_parses(command: str) -> None:
     assert _parses(shlex.split(command)), f"README.md documents an unparseable command: slack-scrollback {command}"
 
 
-def test_the_skill_has_a_recipe_for_every_subcommand() -> None:
+def test_the_skill_has_a_recipe_for_every_agent_facing_subcommand() -> None:
+    """`sync` is deliberately absent: it is the operator's scheduled job, and a
+    recipe for it would invite an agent to rebuild the archive mid-question."""
     documented = {command.split()[0] for command in _commands(SKILL)}
-    assert {"channels", "history", "thread", "search"} <= documented
+    assert {"channels", "history", "thread", "search", "file"} <= documented
 
 
 def _real_flags(parser: argparse.ArgumentParser) -> set[str]:
@@ -108,8 +110,24 @@ def test_no_document_offers_a_flag_that_does_not_exist(doc: str, name: str) -> N
 
 
 def test_the_skill_documents_every_flag_an_agent_could_want() -> None:
-    """A flag the model never hears about may as well not exist."""
-    operator_only = {"--token", "--config", "--timeout", "--version", "--help"}
+    """A flag the model never hears about may as well not exist.
+
+    Operator-only flags are the exception: credentials, plumbing paths, and the
+    whole of `sync` (a scheduled job, not an answer to a question) would only
+    dilute the flag table's "this is everything" promise.
+    """
+    operator_only = {
+        "--token",
+        "--config",
+        "--timeout",
+        "--version",
+        "--help",
+        "--archive-dir",
+        "--full",
+        "--recheck",
+        "--media",
+        "--media-max-bytes",
+    }
     missing = REAL_FLAGS - _documented_flags(SKILL) - operator_only
     assert not missing, f"SKILL.md never mentions: {sorted(missing)}"
 

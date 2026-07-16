@@ -20,6 +20,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
+from .archive import DEFAULT_MEDIA_MAX_BYTES, DEFAULT_MEDIA_TIERS, MEDIA_TIERS
 from .errors import ConfigError
 
 ENV_TOKEN = "SLACK_BOT_TOKEN"
@@ -34,6 +35,11 @@ JSON_FIELD = "slack_bot_token"
 
 BOT_TOKEN_PREFIX = "xoxb-"
 USER_TOKEN_PREFIX = "xoxp-"
+
+ENV_ARCHIVE_DIR = "SLACK_SCROLLBACK_ARCHIVE_DIR"
+CONFIG_KEY_ARCHIVE_DIR = "ARCHIVE_DIR"
+CONFIG_KEY_MEDIA_TIERS = "MEDIA_TIERS"
+CONFIG_KEY_MEDIA_MAX_BYTES = "MEDIA_MAX_BYTES"
 
 
 def config_candidates(environ: Mapping[str, str] | None = None) -> list[Path]:
@@ -163,6 +169,89 @@ def token_from_json(path: Path, *, source: str) -> str:
     if not isinstance(value, str):
         raise ConfigError(f"the '{JSON_FIELD}' field in {path} is a {type(value).__name__}, not a string")
     return _validate(value, f"the '{JSON_FIELD}' field in {path}")
+
+
+def resolve_archive_dir(
+    *,
+    flag: str | None = None,
+    config_path: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Where the archive lives, with the same precedence shape as the token.
+
+    ``--archive-dir``, then ``$SLACK_SCROLLBACK_ARCHIVE_DIR``, then
+    ``ARCHIVE_DIR`` in the config file, then the XDG-conventional default.
+    Note the flag is a *path*; ``--archive`` (no ``-dir``) is the backend
+    selector and a different thing entirely.
+    """
+    env = os.environ if environ is None else environ
+    if flag:
+        return Path(flag).expanduser()
+    from_env = env.get(ENV_ARCHIVE_DIR)
+    if from_env:
+        return Path(from_env).expanduser()
+    config = load_config(config_path or default_config_path(env))
+    from_file = config.get(CONFIG_KEY_ARCHIVE_DIR)
+    if from_file:
+        return Path(from_file).expanduser()
+    return Path(os.path.expanduser("~")) / ".local" / "share" / "slack-scrollback"
+
+
+def resolve_media_settings(
+    *,
+    tiers_flag: str | None = None,
+    max_bytes_flag: int | None = None,
+    config_path: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[frozenset[str], int | None]:
+    """The media tiers ``sync`` downloads, and the per-file size cap.
+
+    Flags beat the config file's ``MEDIA_TIERS``/``MEDIA_MAX_BYTES``; the
+    default is documents and images with no size cap — the tier list, not a
+    byte count, is what bounds an archive. ``0`` also means uncapped, so a
+    config file's cap can be lifted from the command line. ``none`` turns
+    downloads off entirely — metadata is still recorded, because it costs
+    nothing and makes a later change of mind a re-download instead of a
+    blind spot.
+    """
+    env = os.environ if environ is None else environ
+    config = load_config(config_path or default_config_path(env))
+
+    raw_tiers = tiers_flag if tiers_flag is not None else config.get(CONFIG_KEY_MEDIA_TIERS)
+    if raw_tiers is None:
+        tiers = DEFAULT_MEDIA_TIERS
+    else:
+        wanted = {piece.strip().lower() for piece in raw_tiers.split(",") if piece.strip()}
+        if wanted == {"none"}:
+            tiers = frozenset()
+        else:
+            unknown = wanted - set(MEDIA_TIERS)
+            if unknown or not wanted:
+                raise ConfigError(
+                    f"--media/{CONFIG_KEY_MEDIA_TIERS} must be 'none' or a comma-separated subset of "
+                    f"{', '.join(MEDIA_TIERS)} — not {raw_tiers!r}"
+                )
+            tiers = frozenset(wanted)
+
+    max_bytes: int | None
+    if max_bytes_flag is not None:
+        max_bytes = max_bytes_flag
+    else:
+        raw_max = config.get(CONFIG_KEY_MEDIA_MAX_BYTES)
+        if raw_max is None:
+            max_bytes = DEFAULT_MEDIA_MAX_BYTES
+        else:
+            try:
+                max_bytes = int(raw_max)
+            except ValueError:
+                raise ConfigError(
+                    f"{CONFIG_KEY_MEDIA_MAX_BYTES} must be a byte count like 52428800, not {raw_max!r}"
+                ) from None
+    if max_bytes is not None and max_bytes < 0:
+        raise ConfigError(f"--media-max-bytes must not be negative (got {max_bytes}) — use 0 or omit it for no limit")
+    if max_bytes == 0:
+        max_bytes = None
+    return tiers, max_bytes
 
 
 def resolve_token(

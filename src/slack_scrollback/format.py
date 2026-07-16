@@ -14,7 +14,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
+from pathlib import Path
 from typing import Any
 
 from .workspace import Conversation, Entry, FetchResult
@@ -25,6 +26,10 @@ _ENTITY_RE = re.compile(r"<(.*?)>")
 _INDENT = "  "
 
 NameLookup = Callable[[str], str]
+
+#: How an archive answers "are this file's bytes on local disk?" — file ID in,
+#: absolute path or None out. Live output uses it too, when an archive exists.
+LocalPathLookup = Callable[[str], Path | None]
 
 
 def unescape(text: str) -> str:
@@ -180,6 +185,7 @@ def format_entry(
     resolve_channel: NameLookup,
     show_channel: bool = False,
     permalink: str | None = None,
+    file_permalinks: Sequence[str] = (),
 ) -> str:
     """One message as a single line."""
     indent = _INDENT * entry.depth
@@ -190,7 +196,43 @@ def format_entry(
     line = f"{indent}[{when}] {where}{who}: {body}"
     if permalink:
         line = f"{line} {permalink}"
+    for link in file_permalinks:
+        line = f"{line} {link}"
     return line
+
+
+def file_permalinks(message: dict[str, Any]) -> list[str]:
+    """The permalinks of a message's files, for ``--links``.
+
+    A file permalink is a *reference*: the ``file`` command accepts it back,
+    which is how a text-mode agent gets from a ``[file: ...]`` marker to
+    actual bytes. ``url_private`` is deliberately not this — it is never
+    printed anywhere.
+    """
+    out: list[str] = []
+    for entry in message.get("files") or []:
+        if isinstance(entry, dict) and entry.get("permalink"):
+            out.append(str(entry["permalink"]))
+    return out
+
+
+def file_ref(raw_file: dict[str, Any], local_path_of: LocalPathLookup | None) -> dict[str, Any]:
+    """One file as stable JSON: identity, metadata, and where its bytes are.
+
+    ``local_path`` is filled whenever an archive holds the bytes, on live and
+    archive reads alike; without an archive it is null, never an error.
+    """
+    file_id = str(raw_file.get("id") or "") or None
+    size = raw_file.get("size")
+    local = local_path_of(file_id) if (local_path_of is not None and file_id) else None
+    return {
+        "id": file_id,
+        "name": raw_file.get("name") or raw_file.get("title"),
+        "mimetype": raw_file.get("mimetype"),
+        "size": size if isinstance(size, int) else None,
+        "permalink": raw_file.get("permalink"),
+        "local_path": str(local) if local is not None else None,
+    }
 
 
 def entry_to_dict(
@@ -199,11 +241,14 @@ def entry_to_dict(
     resolve_user: NameLookup,
     resolve_channel: NameLookup,
     permalink: str | None = None,
+    local_path_of: LocalPathLookup | None = None,
 ) -> dict[str, Any]:
     """A message as stable JSON.
 
     ``ts`` stays the verbatim Slack string: it is the message's identity, and a
-    float round-trip silently destroys its low digits.
+    float round-trip silently destroys its low digits. ``files`` entries are
+    objects (see :func:`file_ref`) so an agent can hand their ``id`` or
+    ``permalink`` straight to the ``file`` command.
     """
     message = entry.message
     user_id = message.get("user")
@@ -219,7 +264,7 @@ def entry_to_dict(
         "thread_ts": str(message.get("thread_ts")) if message.get("thread_ts") else None,
         "is_reply": entry.depth > 0,
         "subtype": message.get("subtype"),
-        "files": [f.get("name") for f in message.get("files") or [] if isinstance(f, dict)],
+        "files": [file_ref(f, local_path_of) for f in message.get("files") or [] if isinstance(f, dict)],
         "permalink": permalink,
     }
 
@@ -268,6 +313,8 @@ def render_messages(
     show_channel: bool = False,
     as_json: bool = False,
     permalinks: dict[tuple[str, str], str] | None = None,
+    local_path_of: LocalPathLookup | None = None,
+    provenance: str | None = None,
 ) -> list[str]:
     """The whole output for a message-listing command, trailers included.
 
@@ -275,6 +322,8 @@ def render_messages(
     incomplete. They therefore appear in both renderings — JSON emits them as
     ``{"type": "notice"}`` records, discriminated from messages by ``type``, so a
     programmatic consumer cannot mistake a truncated read for a complete one.
+    ``provenance`` (set on archive-backed reads) is the last trailer of all: an
+    answer from local disk always says so, and says how to ask Slack instead.
     """
     links = permalinks or {}
     lines: list[str] = []
@@ -286,6 +335,7 @@ def render_messages(
                 resolve_user=resolve_user,
                 resolve_channel=resolve_channel,
                 permalink=links.get(link_key(entry)),
+                local_path_of=local_path_of,
             )
             lines.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         for notice in _notices(result, limit=limit):
@@ -296,11 +346,14 @@ def render_messages(
                     sort_keys=True,
                 )
             )
+        if provenance:
+            lines.append(json.dumps({"type": "notice", "source": "archive", "text": provenance}, sort_keys=True))
         return lines
 
     if not result.entries:
         lines.append("(no messages found)")
     for entry in result.entries:
+        wants_links = link_key(entry) in links
         lines.append(
             format_entry(
                 entry,
@@ -308,17 +361,22 @@ def render_messages(
                 resolve_channel=resolve_channel,
                 show_channel=show_channel,
                 permalink=links.get(link_key(entry)),
+                file_permalinks=file_permalinks(entry.message) if wants_links else (),
             )
         )
     lines.extend(f"[{notice}]" for notice in _notices(result, limit=limit))
+    if provenance:
+        lines.append(f"[{provenance}]")
     return lines
 
 
-def render_channels(rows: Iterable[tuple[Conversation, str | None]], *, as_json: bool = False) -> list[str]:
+def render_channels(
+    rows: Iterable[tuple[Conversation, str | None]], *, as_json: bool = False, provenance: str | None = None
+) -> list[str]:
     """The `channels` table: id, name, members, last activity."""
     materialised = list(rows)
     if as_json:
-        return [
+        lines = [
             json.dumps(
                 {
                     "id": conversation.id,
@@ -333,6 +391,9 @@ def render_channels(rows: Iterable[tuple[Conversation, str | None]], *, as_json:
             )
             for conversation, last in materialised
         ]
+        if provenance:
+            lines.append(json.dumps({"type": "notice", "source": "archive", "text": provenance}, sort_keys=True))
+        return lines
 
     if not materialised:
         return [
@@ -350,4 +411,6 @@ def render_channels(rows: Iterable[tuple[Conversation, str | None]], *, as_json:
             f"{conversation.name[:name_width].ljust(name_width)}  {conversation.kind:<9}  "
             f"{members:>7}  {when:<19}  {conversation.id}"
         )
+    if provenance:
+        lines.append(f"[{provenance}]")
     return lines

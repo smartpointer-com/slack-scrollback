@@ -417,3 +417,110 @@ def test_long_channel_names_do_not_break_the_table() -> None:
     long_name = Conversation(id="C0EXAMPLE2", kind="public", raw={}, name="#" + "x" * 80)
     lines = render_channels([(long_name, None)])
     assert len(lines) == 2
+
+
+# -- files as objects, enrichment, and provenance ------------------------------
+
+
+def entry_with_file(**file_extra: Any) -> Entry:
+    raw_file = {
+        "id": "F0EXAMPLE1",
+        "name": "plan.pdf",
+        "mimetype": "application/pdf",
+        "size": 1234,
+        "permalink": "https://acme.slack.com/files/U0EXAMPLE1/F0EXAMPLE1/plan.pdf",
+        "url_private": "https://files.slack.com/files-pri/T0EXAMPLE1-F0EXAMPLE1/plan.pdf",
+        **file_extra,
+    }
+    return Entry(message=message("1700000000.000001", files=[raw_file]), conversation=conversation())
+
+
+class TestFileObjects:
+    """JSON `files` entries are objects an agent can act on, never bare names."""
+
+    def test_shape_carries_identity_metadata_and_permalink(self) -> None:
+        payload = entry_to_dict(entry_with_file(), resolve_user=user_of, resolve_channel=channel_of)
+        (ref,) = payload["files"]
+        assert ref == {
+            "id": "F0EXAMPLE1",
+            "name": "plan.pdf",
+            "mimetype": "application/pdf",
+            "size": 1234,
+            "permalink": "https://acme.slack.com/files/U0EXAMPLE1/F0EXAMPLE1/plan.pdf",
+            "local_path": None,
+        }
+
+    def test_url_private_never_leaks_into_the_record(self) -> None:
+        payload = entry_to_dict(entry_with_file(), resolve_user=user_of, resolve_channel=channel_of)
+        assert "files-pri" not in json.dumps(payload)
+
+    def test_local_path_is_filled_by_the_lookup(self, tmp_path: Any) -> None:
+        target = tmp_path / "media" / "F0EXAMPLE1" / "plan.pdf"
+        payload = entry_to_dict(
+            entry_with_file(),
+            resolve_user=user_of,
+            resolve_channel=channel_of,
+            local_path_of=lambda file_id: target if file_id == "F0EXAMPLE1" else None,
+        )
+        assert payload["files"][0]["local_path"] == str(target)
+
+    def test_a_retention_stub_still_yields_a_well_formed_object(self) -> None:
+        entry = Entry(message=message("1700000000.000001", files=[{"id": "F0EXAMPLE2"}]), conversation=conversation())
+        payload = entry_to_dict(entry, resolve_user=user_of, resolve_channel=channel_of)
+        (ref,) = payload["files"]
+        assert ref["id"] == "F0EXAMPLE2"
+        assert ref["name"] is None
+        assert ref["local_path"] is None
+
+
+class TestFilePermalinksInTextMode:
+    def test_appended_only_when_the_message_link_is_wanted(self) -> None:
+        entry = entry_with_file()
+        result = FetchResult(entries=[entry])
+        linked = render_messages(
+            result,
+            resolve_user=user_of,
+            resolve_channel=channel_of,
+            limit=10,
+            permalinks={("C0EXAMPLE1", "1700000000.000001"): "https://acme.slack.com/archives/C0EXAMPLE1/p1"},
+        )
+        assert linked[0].endswith(
+            "https://acme.slack.com/archives/C0EXAMPLE1/p1 https://acme.slack.com/files/U0EXAMPLE1/F0EXAMPLE1/plan.pdf"
+        )
+        bare = render_messages(result, resolve_user=user_of, resolve_channel=channel_of, limit=10)
+        assert "files/U0EXAMPLE1" not in bare[0]
+
+
+class TestProvenance:
+    """An answer from local disk must say so, in both renderings, last of all."""
+
+    PROVENANCE = "from local archive, synced 2026-07-16 14:32 — pass --live to read Slack directly"
+
+    def test_text_mode_ends_with_the_bracketed_trailer(self) -> None:
+        result = FetchResult(entries=[Entry(message=message("1700000000.000001"), conversation=conversation())])
+        result.truncated = True
+        lines = render_messages(
+            result, resolve_user=user_of, resolve_channel=channel_of, limit=1, provenance=self.PROVENANCE
+        )
+        assert lines[-1] == f"[{self.PROVENANCE}]"
+        assert "truncated" in lines[-2]
+
+    def test_json_mode_emits_a_notice_record_with_source_archive(self) -> None:
+        result = FetchResult(entries=[])
+        lines = render_messages(
+            result, resolve_user=user_of, resolve_channel=channel_of, limit=1, as_json=True, provenance=self.PROVENANCE
+        )
+        record = json.loads(lines[-1])
+        assert record == {"type": "notice", "source": "archive", "text": self.PROVENANCE}
+
+    def test_channels_table_carries_the_trailer_too(self) -> None:
+        rows = [(conversation(), "1700000000.000001")]
+        lines = render_channels(rows, provenance=self.PROVENANCE)
+        assert lines[-1] == f"[{self.PROVENANCE}]"
+        json_lines = render_channels(rows, as_json=True, provenance=self.PROVENANCE)
+        assert json.loads(json_lines[-1])["source"] == "archive"
+
+    def test_no_provenance_means_no_trailer(self) -> None:
+        result = FetchResult(entries=[])
+        lines = render_messages(result, resolve_user=user_of, resolve_channel=channel_of, limit=1, as_json=True)
+        assert lines == []

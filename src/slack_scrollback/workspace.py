@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import difflib
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,6 +34,9 @@ _ALL_TYPES = "public_channel,private_channel,mpim,im"
 # distributed outside the Marketplace. Asking for more and receiving exactly this
 # many, with more still pending, is the signature of that cap.
 _THROTTLE_CAP = 15
+
+#: Subtypes `search` never matches: joins and leaves are room traffic, not speech.
+SEARCH_EXCLUDED_SUBTYPES: frozenset[str] = frozenset({"channel_join", "channel_leave", "group_join", "group_leave"})
 
 
 @dataclass(frozen=True)
@@ -106,6 +109,92 @@ def is_readable(raw: dict[str, Any]) -> bool:
     return bool(raw.get("is_member"))
 
 
+def resolve_conversation(spec: str, conversations: list[Conversation]) -> Conversation:
+    """Turn ``#name``, ``name``, or an ID into one of ``conversations``.
+
+    A miss names the closest alternatives, because the caller is usually a
+    language model that will copy a suggestion straight into its retry. Both
+    backends resolve through here, so a channel spec means the same thing
+    against Slack and against the archive.
+    """
+    wanted = spec.strip()
+    if not wanted:
+        raise UsageError("no channel given — pass a name like '#general' or an ID like C0EXAMPLE1")
+
+    for conversation in conversations:
+        if conversation.id == wanted:
+            return _require_readable(conversation)
+
+    bare = wanted.lstrip("#@")
+    lowered = bare.lower()
+    for conversation in conversations:
+        if str(conversation.raw.get("name") or "").lower() == lowered:
+            return _require_readable(conversation)
+
+    # DMs are addressed by the other person's name, which lives on the user
+    # record rather than the conversation.
+    dms = [c for c in conversations if c.kind == KIND_DM]
+    for conversation in dms:
+        if conversation.name.lstrip("@").lower() == lowered:
+            return _require_readable(conversation)
+
+    # "@alice" should reach "Alice Jones": people are named by whatever part
+    # of the name the requester holds. Only an unambiguous hit counts —
+    # guessing between two people would silently answer about the wrong one.
+    partial = [c for c in dms if lowered and lowered in c.name.lstrip("@").lower()]
+    if len(partial) == 1:
+        return _require_readable(partial[0])
+    if len(partial) > 1:
+        names = ", ".join(sorted(c.name for c in partial))
+        raise UsageError(f"{wanted!r} matches several DMs ({names}) — name the one you mean exactly")
+
+    raise UsageError(_unknown_channel_message(wanted, conversations))
+
+
+def _unknown_channel_message(wanted: str, conversations: list[Conversation]) -> str:
+    readable = [c for c in conversations if is_readable(c.raw) and not c.is_archived]
+    names = [c.name for c in sorted(readable, key=Conversation.sort_key)]
+    close = difflib.get_close_matches(wanted.lstrip("#@"), [n.lstrip("#@") for n in names], n=3, cutoff=0.5)
+    if close:
+        suggestion = " or ".join(f"'{name}'" for name in close)
+        return (
+            f"no conversation matches {wanted!r} — did you mean {suggestion}? "
+            f"Run 'slack-scrollback channels' to list every conversation this bot can read"
+        )
+    preview = ", ".join(names[:8]) if names else "(none — the bot has not been invited anywhere)"
+    return (
+        f"no conversation matches {wanted!r}. Readable conversations include: {preview}. "
+        f"Run 'slack-scrollback channels' for the full list"
+    )
+
+
+def _require_readable(conversation: Conversation) -> Conversation:
+    if is_readable(conversation.raw):
+        return conversation
+    raise UsageError(
+        f"the bot can see {conversation.name} but is not a member, so Slack serves it no history — "
+        f"invite the bot by typing '/invite @your-bot-name' in {conversation.name}, then retry"
+    )
+
+
+def no_such_speaker_note(wanted: str, names: list[str]) -> str:
+    """Distinguish "said nothing" from "not spelt like that".
+
+    An empty result for ``--from`` is ambiguous, and the ambiguity is
+    expensive: the requester cannot tell whether the person was silent or
+    merely misnamed, and has nothing to try differently. Naming who did speak
+    resolves it and supplies the correction.
+    """
+    if not names:
+        return f"nobody spoke in this window, so there is nothing from '{wanted}' to find"
+    if any(wanted in name.lower() for name in names):
+        return f"'{wanted}' spoke in this window, but said nothing matching the query"
+    return (
+        f"nobody matching '{wanted}' spoke in this window — people who did: {', '.join(names)}. "
+        f"Re-run --from with one of those names, or drop --from"
+    )
+
+
 class Workspace:
     """Read-only view of everything the bot token can see."""
 
@@ -159,6 +248,19 @@ class Workspace:
         for user_id in dict.fromkeys(user_ids):
             if user_id and user_id not in self._users:
                 self.user_name(user_id)
+
+    def seed_user_names(self, names: Mapping[str, str]) -> None:
+        """Pre-fill the name cache, e.g. from an archive's users table.
+
+        A seeded ID costs no request; anything absent still resolves through
+        ``users.info`` on first use.
+        """
+        for user_id, name in names.items():
+            self._users.setdefault(user_id, name)
+
+    def known_user_names(self) -> dict[str, str]:
+        """Every name resolved or seeded so far this run."""
+        return dict(self._users)
 
     def channel_name(self, channel_id: str) -> str:
         """Name for a channel ID, for rendering ``<#C…>`` mentions.
@@ -243,70 +345,8 @@ class Workspace:
         return sorted(out, key=Conversation.sort_key)
 
     def resolve(self, spec: str) -> Conversation:
-        """Turn ``#name``, ``name``, or an ID into a conversation.
-
-        A miss names the closest alternatives, because the caller is usually a
-        language model that will copy a suggestion straight into its retry.
-        """
-        wanted = spec.strip()
-        if not wanted:
-            raise UsageError("no channel given — pass a name like '#general' or an ID like C0EXAMPLE1")
-
-        conversations = self.all_conversations()
-
-        for conversation in conversations:
-            if conversation.id == wanted:
-                return self._require_readable(conversation)
-
-        bare = wanted.lstrip("#@")
-        lowered = bare.lower()
-        for conversation in conversations:
-            if str(conversation.raw.get("name") or "").lower() == lowered:
-                return self._require_readable(conversation)
-
-        # DMs are addressed by the other person's name, which lives on the user
-        # record rather than the conversation.
-        dms = [c for c in conversations if c.kind == KIND_DM]
-        for conversation in dms:
-            if conversation.name.lstrip("@").lower() == lowered:
-                return self._require_readable(conversation)
-
-        # "@alice" should reach "Alice Jones": people are named by whatever part
-        # of the name the requester holds. Only an unambiguous hit counts —
-        # guessing between two people would silently answer about the wrong one.
-        partial = [c for c in dms if lowered and lowered in c.name.lstrip("@").lower()]
-        if len(partial) == 1:
-            return self._require_readable(partial[0])
-        if len(partial) > 1:
-            names = ", ".join(sorted(c.name for c in partial))
-            raise UsageError(f"{wanted!r} matches several DMs ({names}) — name the one you mean exactly")
-
-        raise UsageError(self._unknown_channel_message(wanted, conversations))
-
-    def _unknown_channel_message(self, wanted: str, conversations: list[Conversation]) -> str:
-        readable = [c for c in conversations if is_readable(c.raw) and not c.is_archived]
-        names = [c.name for c in sorted(readable, key=Conversation.sort_key)]
-        close = difflib.get_close_matches(wanted.lstrip("#@"), [n.lstrip("#@") for n in names], n=3, cutoff=0.5)
-        if close:
-            suggestion = " or ".join(f"'{name}'" for name in close)
-            return (
-                f"no conversation matches {wanted!r} — did you mean {suggestion}? "
-                f"Run 'slack-scrollback channels' to list every conversation this bot can read"
-            )
-        preview = ", ".join(names[:8]) if names else "(none — the bot has not been invited anywhere)"
-        return (
-            f"no conversation matches {wanted!r}. Readable conversations include: {preview}. "
-            f"Run 'slack-scrollback channels' for the full list"
-        )
-
-    @staticmethod
-    def _require_readable(conversation: Conversation) -> Conversation:
-        if is_readable(conversation.raw):
-            return conversation
-        raise UsageError(
-            f"the bot can see {conversation.name} but is not a member, so Slack serves it no history — "
-            f"invite the bot by typing '/invite @your-bot-name' in {conversation.name}, then retry"
-        )
+        """Turn ``#name``, ``name``, or an ID into a conversation."""
+        return resolve_conversation(spec, self.all_conversations())
 
     def last_activity(self, conversation: Conversation) -> str | None:
         """Timestamp of the most recent message, or None if unavailable.
@@ -328,7 +368,7 @@ class Workspace:
 
     # -- messages ----------------------------------------------------------
 
-    def _history_pages(
+    def history_pages(
         self,
         conversation: Conversation,
         *,
@@ -384,7 +424,7 @@ class Workspace:
         seen_ts: set[str] = set()
         total = 0
 
-        for page, throttled in self._history_pages(
+        for page, throttled in self.history_pages(
             conversation, oldest=oldest, latest=latest, page_limit=min(max(limit, 1), 1000)
         ):
             result.throttled = result.throttled or throttled
@@ -534,7 +574,7 @@ class Workspace:
         # not the output cap.
         for conversation in conversations:
             try:
-                pages = self._history_pages(
+                pages = self.history_pages(
                     conversation,
                     oldest=oldest,
                     latest=latest,
@@ -577,12 +617,7 @@ class Workspace:
         return result
 
     def _matches(self, message: dict[str, Any], needle: str, wanted_user: str | None) -> bool:
-        if str(message.get("subtype") or "") in (
-            "channel_join",
-            "channel_leave",
-            "group_join",
-            "group_leave",
-        ):
+        if str(message.get("subtype") or "") in SEARCH_EXCLUDED_SUBTYPES:
             return False
         text = str(message.get("text") or "")
         if needle not in text.lower():
@@ -592,24 +627,10 @@ class Workspace:
         return True
 
     def _no_such_speaker_note(self, wanted: str, authors: set[str]) -> str:
-        """Distinguish "said nothing" from "not spelt like that".
-
-        An empty result for ``--from`` is ambiguous, and the ambiguity is
-        expensive: the requester cannot tell whether the person was silent or
-        merely misnamed, and has nothing to try differently. Naming who did speak
-        resolves it and supplies the correction.
-        """
         # The scan already resolved (and cached) any author it tested, so this
         # costs nothing for names already seen; the slice bounds the rest.
         names = sorted({self.user_name(user_id) for user_id in sorted(authors)[:12]})
-        if not names:
-            return f"nobody spoke in this window, so there is nothing from '{wanted}' to find"
-        if any(wanted in name.lower() for name in names):
-            return f"'{wanted}' spoke in this window, but said nothing matching the query"
-        return (
-            f"nobody matching '{wanted}' spoke in this window — people who did: {', '.join(names)}. "
-            f"Re-run --from with one of those names, or drop --from"
-        )
+        return no_such_speaker_note(wanted, names)
 
     def _is_speaker(self, message: dict[str, Any], wanted: str) -> bool:
         """Whether ``wanted`` names this message's author.

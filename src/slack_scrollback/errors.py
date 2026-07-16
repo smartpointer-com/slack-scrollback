@@ -31,6 +31,14 @@ class UsageError(ScrollbackError):
     """Arguments were valid syntax but cannot be acted on (e.g. unknown channel)."""
 
 
+class DownloadError(ScrollbackError):
+    """A file's bytes could not be fetched, or failed verification.
+
+    Raised per file and caught per file: one refused download is reported and
+    skipped, never allowed to abort a whole sync run.
+    """
+
+
 class SlackApiError(ScrollbackError):
     """Slack returned ``ok: false``.
 

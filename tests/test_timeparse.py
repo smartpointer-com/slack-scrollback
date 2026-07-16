@@ -124,3 +124,32 @@ def test_parsing_without_an_explicit_now_uses_the_local_clock() -> None:
     parsed = parse_time("0s", flag="--since")
     after = dt.datetime.now().timestamp()
     assert before <= parsed <= after
+
+
+# -- durations (`--recheck`) --------------------------------------------------
+
+
+class TestParseDuration:
+    def test_resolves_each_unit_to_seconds(self) -> None:
+        from slack_scrollback.timeparse import parse_duration
+
+        assert parse_duration("7d", flag="--recheck") == 7 * 86400.0
+        assert parse_duration("24h", flag="--recheck") == 86400.0
+        assert parse_duration("30m", flag="--recheck") == 1800.0
+        assert parse_duration("45s", flag="--recheck") == 45.0
+        assert parse_duration("2w", flag="--recheck") == 2 * 604800.0
+
+    def test_tolerates_case_and_whitespace(self) -> None:
+        from slack_scrollback.timeparse import parse_duration
+
+        assert parse_duration(" 7D ", flag="--recheck") == 7 * 86400.0
+
+    @pytest.mark.parametrize("bad", ["", "7", "d", "2026-01-31", "today", "7 days", "-3d"])
+    def test_rejects_everything_that_is_not_a_bare_duration(self, bad: str) -> None:
+        """A date is a point in time; `--recheck` asks for a span. Accepting one
+        would silently mean something other than what was typed."""
+        from slack_scrollback.timeparse import parse_duration
+
+        with pytest.raises(UsageError) as excinfo:
+            parse_duration(bad, flag="--recheck")
+        assert "--recheck" in str(excinfo.value)

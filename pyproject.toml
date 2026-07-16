@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "slack-scrollback"
-version = "0.1.0"
+version = "0.2.0"
 description = "Read-only Slack history and search for LLM agents, over a bot token, as deterministic CLI calls."
 readme = "README.md"
 requires-python = ">=3.11"

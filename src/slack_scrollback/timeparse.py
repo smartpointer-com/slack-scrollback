@@ -116,6 +116,19 @@ def parse_time(text: str, *, flag: str, upper_bound: bool = False, now: dt.datet
     raise UsageError(f"cannot understand {flag} {raw!r} — {SYNTAX_HELP}")
 
 
+def parse_duration(text: str, *, flag: str) -> float:
+    """Resolve a bare duration — ``7d``, ``12h``, ``30m`` — to seconds.
+
+    Durations only: a calendar date is a point in time, and a flag like
+    ``--recheck`` asks for a span, so accepting one would silently mean
+    something other than what was typed.
+    """
+    match = _DURATION_RE.match(text.strip().lower())
+    if not match:
+        raise UsageError(f"cannot understand {flag} {text!r} — use a duration like 7d, 24h or 30m")
+    return float(int(match.group(1)) * _UNIT_SECONDS[match.group(2).lower()])
+
+
 def to_slack_ts(epoch: float) -> str:
     """Render epoch seconds as a Slack timestamp bound.
 
