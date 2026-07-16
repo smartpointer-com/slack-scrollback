@@ -21,8 +21,10 @@ trace of a reply to an old thread, so replies are found two ways: parents seen
 in the window carry ``reply_count``/``latest_reply`` and are re-read when those
 moved past what the archive holds, and threads with any *stored* activity
 inside the window are re-asked outright. What that still misses — a thread
-silent for longer than the recheck window coming back to life — is repaired by
-the next ``--full`` run, and the README says so.
+silent for longer than the recheck window coming back to life — is caught when
+the repair sweep re-serves its parent, within a lap. The one drift no lap can
+see is an edit to an old reply, which moves no counter a history page carries;
+``--full`` remains its repair, and the README says so.
 """
 
 from __future__ import annotations
@@ -42,6 +44,13 @@ from .workspace import SLACKBOT_USER_ID, Conversation, Entry, Workspace
 
 #: How long an archived user name is trusted before ``users.info`` re-asks.
 USER_REFRESH_SECONDS = 30 * 24 * 3600.0
+
+#: The repair sweep's slice size: one conversations.history page per slice.
+SWEEP_PAGE_SIZE = 200
+
+#: The name rota re-checks at most one user per run, and only one at least
+#: this stale — churning fresher names would be requests spent on nothing.
+USER_ROTA_MIN_AGE_SECONDS = 24 * 3600.0
 
 DEFAULT_RECHECK = "7d"
 
@@ -73,6 +82,11 @@ class SyncReport:
     synced_at: float = 0.0
     throttled: bool = False
     notes: list[str] = field(default_factory=list)
+    #: Repair-sweep telemetry: slices fetched, the oldest ts re-verified this
+    #: run, and whether every conversation's lap is complete as of this run.
+    sweep_pages: int = 0
+    sweep_oldest_verified: str | None = None
+    sweep_lap_completed: bool = True
 
 
 class Syncer:
@@ -97,6 +111,8 @@ class Syncer:
         recheck_seconds: float = 7 * 24 * 3600.0,
         media_tiers: frozenset[str] = frozenset(),
         media_max_bytes: int | None = None,
+        sweep_pages: int = 1,
+        sweep_page_size: int = SWEEP_PAGE_SIZE,
         timeout: float = 30.0,
         now_fn: Callable[[], float] = time.time,
         download_transport: Any = None,
@@ -110,6 +126,8 @@ class Syncer:
         self._recheck = recheck_seconds
         self._tiers = media_tiers
         self._max_bytes = media_max_bytes
+        self._sweep_pages = sweep_pages
+        self._sweep_page_size = sweep_page_size
         self._timeout = timeout
         self._now_fn = now_fn
         self._transport = download_transport
@@ -142,10 +160,17 @@ class Syncer:
                     is_member=bool(conversation.raw.get("is_member")) or conversation.kind in ("dm", "group-dm"),
                     now=now,
                 )
-            if self._full:
+            # Reconciling the roster is safe on every run: the listing is
+            # complete (guarded here), gone_at is soft and self-healing, and
+            # a partial listing aborts the whole transaction anyway.
+            if self._workspace.conversations_listing_complete:
                 vanished = self._archive.mark_conversations_gone((c.id for c in conversations), now)
                 if vanished:
                     report.notes.append(f"{vanished} conversations are no longer visible and were marked gone")
+            else:
+                report.notes.append(
+                    "the conversation roster was too long to list completely; vanished conversations were not checked"
+                )
 
             # The Slackbot DM stays in the roster but is never fetched:
             # Slack answers channel_not_found for its history, to every bot,
@@ -161,6 +186,8 @@ class Syncer:
                 report.conversations.append(summary)
 
             self._store_user_names(now)
+            if self._sweep_pages > 0 and not self._full:
+                self._refresh_stalest_name(now)
             self._download_media(now, report)
             self._archive.set_meta("last_sync_at", f"{now:.6f}")
             self._archive.commit()
@@ -170,6 +197,8 @@ class Syncer:
             self._archive.rollback()
             raise
 
+        if self._sweep_pages == 0 and not self._full:
+            report.sweep_lap_completed = False
         if self._archive.fts_unavailable_reason:
             report.notes.append("this SQLite lacks FTS5; archive search will fall back to a full scan")
         report.duration_seconds = time.monotonic() - started
@@ -267,6 +296,12 @@ class Syncer:
             self._tick(f"{label} — thread {thread_index}/{len(to_check)}")
             self._sync_thread(conversation, thread_ts, now, summary, report, evidence_floor=evidence_floor)
 
+        if self._full:
+            # A full run re-verified everything reachable: that IS a lap.
+            self._archive.set_sweep_state(conversation.id, None, now, lap_completed=True)
+        elif self._sweep_pages > 0:
+            self._sweep_conversation(conversation, label, now, summary, report)
+
         if seen_ts:
             self._archive.set_sync_state(conversation.id, newest_seen, now, full=self._full)
         else:
@@ -296,17 +331,125 @@ class Syncer:
         if self._full:
             return set(thread_meta) | self._archive.thread_ts_with_replies(conversation.id)
 
-        to_check: set[str] = set()
-        for thread_ts, (reply_count, latest_reply) in thread_meta.items():
-            stored_count, stored_latest = self._archive.reply_stats(conversation.id, thread_ts)
-            if reply_count != stored_count or (latest_reply and float(latest_reply) > float(stored_latest or 0)):
-                to_check.add(thread_ts)
+        to_check = self._moved_threads(conversation, thread_meta)
         # Threads already known to be recently alive are re-asked even when
         # their parent sits outside the window — the response is the only
         # place a new reply to an old parent shows up at all.
         recent = self._archive.active_thread_ts(conversation.id, oldest_epoch)
         to_check |= {ts for ts in recent if ts not in thread_meta}
         return to_check
+
+    def _moved_threads(self, conversation: Conversation, thread_meta: dict[str, tuple[int, str]]) -> set[str]:
+        """Served parents whose reply state moved past what the archive holds."""
+        moved: set[str] = set()
+        for thread_ts, (reply_count, latest_reply) in thread_meta.items():
+            stored_count, stored_latest = self._archive.reply_stats(conversation.id, thread_ts)
+            if reply_count != stored_count or (bool(latest_reply) and float(latest_reply) > float(stored_latest or 0)):
+                moved.add(thread_ts)
+        return moved
+
+    def _sweep_conversation(
+        self, conversation: Conversation, label: str, now: float, summary: ConversationSummary, report: SyncReport
+    ) -> None:
+        """One fixed-size slice of re-verification, below everything settled.
+
+        The cursor walks from the recheck boundary toward the beginning of
+        history and wraps; each slice re-serves a page, so old edits land,
+        renames re-render, deletions are noticed (with slice-scoped evidence),
+        and re-served parents flow through the same moved-thread diff the
+        window uses. Deliberately absent: the ``active_thread_ts`` union —
+        applied to a slice it would re-ask every historical thread the slice
+        touches, and the fixed budget would explode. Every parent lives in
+        some slice, so a lap still visits every revived thread — but reply
+        *bodies* re-verify only when their thread's counters move: an old
+        reply edited in place is the one drift a lap cannot see, and the
+        README says so.
+        """
+        if report.throttled:
+            # Under the 1 req/min cap the window work must stay affordable;
+            # the lap pauses and resumes when requests are cheap again.
+            self._note_sweep_paused(report)
+            return
+
+        sweep_before, _ = self._archive.sweep_state(conversation.id)
+        lap_completed = False
+        for _ in range(self._sweep_pages):
+            top = sweep_before if sweep_before is not None else f"{now - self._recheck:.6f}"
+            self._tick(f"{label} — sweeping history before {format_timestamp(top)}")
+            messages, has_more, throttled = self._workspace.history_slice(
+                conversation, latest=top, limit=self._sweep_page_size
+            )
+            if throttled:
+                report.throttled = True
+                self._note_sweep_paused(report)
+                break
+            report.sweep_pages += 1
+            seen: set[str] = set()
+            thread_meta: dict[str, tuple[int, str]] = {}
+            for message in messages:
+                ts = str(message.get("ts") or "")
+                if not ts or ts in seen:
+                    continue
+                seen.add(ts)
+                self._count(summary, self._store_message(conversation, message, now))
+                if self._is_thread_parent(message):
+                    thread_meta[ts] = (
+                        int(message.get("reply_count") or 0),
+                        str(message.get("latest_reply") or ""),
+                    )
+            if seen:
+                oldest_served = min(seen, key=float)
+                # Slice-scoped deletion evidence: the page served everything
+                # in [oldest_served, top) — top itself belongs to the previous
+                # slice (Slack's latest is exclusive), so the comparison must
+                # be exclusive too, or top's message is marked gone every lap.
+                expected = self._archive.channel_level_ts_between(
+                    conversation.id, float(oldest_served), float(top), latest_inclusive=False
+                )
+                summary.gone += self._archive.mark_messages_gone(conversation.id, expected - seen, now)
+                for thread_ts in sorted(self._moved_threads(conversation, thread_meta)):
+                    self._sync_thread(
+                        conversation, thread_ts, now, summary, report, evidence_floor=float(oldest_served)
+                    )
+                sweep_before = oldest_served
+                report.sweep_oldest_verified = _older_ts(report.sweep_oldest_verified, oldest_served)
+            if not has_more:
+                lap_completed = True
+                sweep_before = None
+                break
+            if not seen:
+                # More history claimed but nothing served: the cursor cannot
+                # advance without inventing a boundary. Retry next run.
+                break
+
+        self._archive.set_sweep_state(conversation.id, sweep_before, now, lap_completed=lap_completed)
+        if not lap_completed:
+            report.sweep_lap_completed = False
+
+    def _note_sweep_paused(self, report: SyncReport) -> None:
+        note = "the repair sweep was skipped this run (Slack is throttling); the lap resumes when requests are cheap"
+        if note not in report.notes:
+            report.notes.append(note)
+        report.sweep_lap_completed = False
+
+    def _refresh_stalest_name(self, now: float) -> None:
+        """Re-check one user's name per run — the stalest one.
+
+        The seed window trusts archived names for 30 days; without this rota a
+        rename could hide behind that trust indefinitely on a workspace where
+        the person never speaks. One ``users.info`` per run bounds rename lag
+        by max(one rota cycle, one sweep lap) instead.
+        """
+        user_id = self._archive.stalest_user(now=now, min_age_seconds=USER_ROTA_MIN_AGE_SECONDS)
+        if user_id is None:
+            return
+        previous = self._archive.user_names().get(user_id)
+        fresh = self._workspace.refresh_user_name(user_id)
+        if fresh == user_id and previous:
+            # The lookup failed (deleted or invisible account). Keep the name
+            # we had — but bump the clock, or one dead account pins the rota.
+            fresh = previous
+        self._archive.upsert_user(user_id, fresh, now)
 
     def _sync_thread(
         self,
@@ -413,6 +556,10 @@ class Syncer:
             report.bytes_downloaded += written
 
 
+def _older_ts(current: str | None, candidate: str) -> str:
+    return candidate if current is None or float(candidate) < float(current) else current
+
+
 def _human_bytes(count: int) -> str:
     size = float(count)
     for unit in ("B", "KB", "MB", "GB"):
@@ -458,6 +605,11 @@ def render_sync_report(report: SyncReport, *, as_json: bool = False) -> list[str
                     "duration_seconds": round(report.duration_seconds, 3),
                     "archive": report.archive_path,
                     "synced_at": format_timestamp(f"{report.synced_at:.6f}"),
+                    "sweep": {
+                        "pages": report.sweep_pages,
+                        "oldest_verified": report.sweep_oldest_verified,
+                        "lap_completed": report.sweep_lap_completed,
+                    },
                 },
                 ensure_ascii=False,
                 sort_keys=True,

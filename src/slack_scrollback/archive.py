@@ -34,7 +34,7 @@ from typing import Any
 
 from .errors import ScrollbackError, UsageError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DB_NAME = "archive.db"
 MEDIA_DIR_NAME = "media"
@@ -66,7 +66,7 @@ DEFAULT_MEDIA_TIERS = frozenset({"documents", "images"})
 #: real safety valve, so an unset cap defaults to "archive what was shared".
 DEFAULT_MEDIA_MAX_BYTES: int | None = None
 
-_SCHEMA = f"""
+_SCHEMA_V1 = f"""
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE conversations (
@@ -194,6 +194,22 @@ END;
 """
 
 _FTS_DROP_TRIGGERS = "".join(f"DROP TRIGGER IF EXISTS {name};\n" for name in _FTS_TRIGGER_NAMES)
+
+#: Forward-only migration scripts; ``MIGRATIONS[n]`` upgrades a version-n
+#: database to version n+1 and stamps both version markers itself.
+MIGRATIONS: tuple[str, ...] = (
+    # v0 -> v1: the original schema.
+    _SCHEMA_V1
+    + "\nINSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '1');\n"
+    + "PRAGMA user_version = 1;",
+    # v1 -> v2: cursor state for the continuous-repair sweep. sweep_before is
+    # the ts the next slice reads strictly below (NULL = start a new lap);
+    # sweep_lap_at records when the last completed lap finished.
+    "ALTER TABLE sync_state ADD COLUMN sweep_before TEXT;\n"
+    "ALTER TABLE sync_state ADD COLUMN sweep_lap_at REAL;\n"
+    "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '2');\n"
+    "PRAGMA user_version = 2;",
+)
 
 
 @functools.cache
@@ -399,26 +415,27 @@ class Archive:
         return int(self._con.execute("PRAGMA user_version").fetchone()[0])
 
     def _migrate(self) -> None:
-        """Create or upgrade the schema, forward-only."""
+        """Create or upgrade the schema, forward-only, one version at a time.
+
+        A fresh database walks the same chain as an old one — v0 to v1 to v2 —
+        so every upgrade step runs on every developer machine every day, not
+        only on the one archive in the field old enough to need it.
+        """
         version = self._user_version()
         if version > SCHEMA_VERSION:
             raise ScrollbackError(
                 f"the archive at {self.directory} has schema version {version}, newer than this tool understands "
                 f"({SCHEMA_VERSION}) — upgrade slack-scrollback"
             )
-        if version == SCHEMA_VERSION:
-            return
-        # The transaction lives inside the script: executescript() commits any
-        # transaction already open before it runs, so wrapping it in
-        # begin()/commit() from out here would silently fall apart.
-        if version == 0:
-            self._con.executescript(
-                "BEGIN;\n"
-                + _SCHEMA
-                + f"\nINSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');\n"
-                + f"PRAGMA user_version = {SCHEMA_VERSION};\n"
-                + "COMMIT;"
-            )
+        while version < SCHEMA_VERSION:
+            # The transaction lives inside the script: executescript() commits
+            # any transaction already open before it runs, so wrapping it in
+            # begin()/commit() from out here would silently fall apart.
+            self._con.executescript("BEGIN;\n" + MIGRATIONS[version] + "\nCOMMIT;")
+            advanced = self._user_version()
+            if advanced <= version:  # pragma: no cover - a migration authoring bug
+                raise ScrollbackError(f"schema migration from version {version} did not advance — this is a bug")
+            version = advanced
 
     def _fts_exists(self) -> bool:
         row = self._con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'").fetchone()
@@ -488,8 +505,12 @@ class Archive:
         )
 
     def mark_conversations_gone(self, listed_ids: Iterable[str], now: float) -> int:
-        """Mark conversations Slack no longer lists. Only ``--full`` calls this:
-        an incremental run cannot distinguish "gone" from "not looked"."""
+        """Mark conversations Slack no longer lists.
+
+        Every run calls this — the roster is fetched every run anyway — behind
+        the caller's listing-completeness guard: a truncated listing cannot
+        distinguish "gone" from "not listed this time", so it must not judge.
+        """
         listed = set(listed_ids)
         stored = [str(row["id"]) for row in self._con.execute("SELECT id FROM conversations WHERE gone_at IS NULL")]
         vanished = [cid for cid in stored if cid not in listed]
@@ -508,6 +529,14 @@ class Archive:
         rows = self._con.execute("SELECT id, name FROM users WHERE refreshed_at > ?", (now - max_age_seconds,))
         return {str(row["id"]): str(row["name"]) for row in rows}
 
+    def stalest_user(self, *, now: float, min_age_seconds: float) -> str | None:
+        """The user whose name has gone longest unchecked, if old enough to matter."""
+        row = self._con.execute(
+            "SELECT id FROM users WHERE refreshed_at < ? ORDER BY refreshed_at ASC LIMIT 1",
+            (now - min_age_seconds,),
+        ).fetchone()
+        return str(row["id"]) if row else None
+
     def upsert_user(self, user_id: str, name: str, now: float) -> None:
         self._con.execute(
             """
@@ -522,6 +551,29 @@ class Archive:
     def last_ts(self, channel_id: str) -> str:
         row = self._con.execute("SELECT last_ts FROM sync_state WHERE channel_id = ?", (channel_id,)).fetchone()
         return str(row[0]) if row else "0"
+
+    def sweep_state(self, channel_id: str) -> tuple[str | None, float | None]:
+        """(sweep_before, sweep_lap_at) for one conversation; (None, None) starts a lap."""
+        row = self._con.execute(
+            "SELECT sweep_before, sweep_lap_at FROM sync_state WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        if row is None:
+            return None, None
+        before = str(row["sweep_before"]) if row["sweep_before"] is not None else None
+        lap_at = float(row["sweep_lap_at"]) if row["sweep_lap_at"] is not None else None
+        return before, lap_at
+
+    def set_sweep_state(self, channel_id: str, sweep_before: str | None, now: float, *, lap_completed: bool) -> None:
+        self._con.execute(
+            """
+            INSERT INTO sync_state (channel_id, sweep_before, sweep_lap_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT (channel_id) DO UPDATE SET
+              sweep_before = excluded.sweep_before,
+              sweep_lap_at = COALESCE(excluded.sweep_lap_at, sync_state.sweep_lap_at)
+            """,
+            (channel_id, sweep_before, now if lap_completed else None),
+        )
 
     def set_sync_state(self, channel_id: str, last_ts: str, now: float, *, full: bool) -> None:
         self._con.execute(
@@ -610,16 +662,23 @@ class Archive:
         )
         return "edited" if content_moved else "unchanged"
 
-    def channel_level_ts_between(self, channel_id: str, oldest: float, latest: float) -> set[str]:
+    def channel_level_ts_between(
+        self, channel_id: str, oldest: float, latest: float, *, latest_inclusive: bool = True
+    ) -> set[str]:
         """Timestamps the archive expects ``conversations.history`` to return.
 
         Thread replies are excluded — their absence from a history response is
         normal, not deletion — except broadcast replies, which do appear there.
+        The sweep passes ``latest_inclusive=False``: its slices are bounded by
+        an *exclusive* Slack ``latest``, and an inclusive comparison here would
+        expect the previous slice's oldest message in a response that, by
+        protocol, cannot contain it — falsely marking it gone.
         """
+        comparator = "<=" if latest_inclusive else "<"
         rows = self._con.execute(
-            """
+            f"""
             SELECT ts FROM messages
-            WHERE channel_id = ? AND gone_at IS NULL AND ts_epoch >= ? AND ts_epoch <= ?
+            WHERE channel_id = ? AND gone_at IS NULL AND ts_epoch >= ? AND ts_epoch {comparator} ?
               AND (thread_ts IS NULL OR thread_ts = ts OR subtype = 'thread_broadcast')
             """,
             (channel_id, oldest, latest),
@@ -671,8 +730,8 @@ class Archive:
         reply to an old thread changes nothing in a windowed history response,
         so it can only be found by re-asking the thread itself. Re-checking
         every thread that was recently alive bounds the misses to threads that
-        fell silent for longer than the recheck window — which the next
-        ``--full`` run repairs.
+        fell silent for longer than the recheck window — which the repair
+        sweep catches when a lap re-serves the parent.
         """
         rows = self._con.execute(
             """

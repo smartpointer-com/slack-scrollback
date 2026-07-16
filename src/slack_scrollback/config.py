@@ -40,6 +40,8 @@ ENV_ARCHIVE_DIR = "SLACK_SCROLLBACK_ARCHIVE_DIR"
 CONFIG_KEY_ARCHIVE_DIR = "ARCHIVE_DIR"
 CONFIG_KEY_MEDIA_TIERS = "MEDIA_TIERS"
 CONFIG_KEY_MEDIA_MAX_BYTES = "MEDIA_MAX_BYTES"
+CONFIG_KEY_SWEEP_PAGES = "SWEEP_PAGES"
+DEFAULT_SWEEP_PAGES = 1
 
 
 def config_candidates(environ: Mapping[str, str] | None = None) -> list[Path]:
@@ -252,6 +254,35 @@ def resolve_media_settings(
     if max_bytes == 0:
         max_bytes = None
     return tiers, max_bytes
+
+
+def resolve_sweep_pages(
+    *,
+    flag: int | None = None,
+    config_path: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    """How many pages of older history each sync run re-verifies per conversation.
+
+    ``0`` switches continuous repair off entirely — the sweep and the name
+    rota are one concept with one knob. Flag beats the config file's
+    ``SWEEP_PAGES``; the default is one page.
+    """
+    env = os.environ if environ is None else environ
+    if flag is not None:
+        pages = flag
+    else:
+        raw = load_config(config_path or default_config_path(env)).get(CONFIG_KEY_SWEEP_PAGES)
+        if raw is None:
+            pages = DEFAULT_SWEEP_PAGES
+        else:
+            try:
+                pages = int(raw)
+            except ValueError:
+                raise ConfigError(f"{CONFIG_KEY_SWEEP_PAGES} must be a page count like 1, not {raw!r}") from None
+    if pages < 0:
+        raise ConfigError(f"--sweep must be 0 (repair off) or a positive page count, not {pages}")
+    return pages
 
 
 def resolve_token(

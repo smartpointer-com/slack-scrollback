@@ -218,7 +218,7 @@ Quote channel names: an unquoted `#general` is a comment to the shell.
 | `history <channel>` | Messages in chronological order, newest at the bottom. Thread replies are fetched and indented under their parent. | `--since`, `--until`, `--limit`, `--no-threads` |
 | `thread <permalink \| channel ts>` | One thread in full. A permalink to any reply resolves to the whole thread. | `--limit` |
 | `search <query>` | Case-insensitive substring match. Over the archive when one exists (whole history, instant); over freshly-fetched history otherwise. `--from` matches any part of a name. | `--in`, `--from`, `--since`, `--until`, `--limit` |
-| `sync` | Mirror everything the bot can read into the local archive: messages, threads, edits, deletions, file bytes. The only command that writes anything. | `--full`, `--recheck`, `--media`, `--media-max-bytes` |
+| `sync` | Mirror everything the bot can read into the local archive: messages, threads, edits, deletions, file bytes. The only command that writes anything. | `--full`, `--recheck`, `--sweep`, `--media`, `--media-max-bytes`, `--quiet` |
 | `file <id \| permalink>` | Print a local path to a shared file's bytes — from the archive when it has them, downloaded from Slack otherwise. | `--out`, `--live` |
 
 Every subcommand also takes `--json`, `--token`, `--config`, `--archive-dir`
@@ -259,10 +259,14 @@ slack-scrollback sync --full    # re-read everything reachable; refresh names; r
 ```
 
 Scheduling is deliberately external — cron, launchd, a systemd timer; every 30
-minutes is a sensible cadence, with a `--full` pass every week or so.
-Overlapping runs are harmless: a second `sync` finds `archive.lock` held and
-exits 0. A crashed run changes nothing, because all of a run's writes commit as
-a single transaction at the end; re-running is always safe.
+minutes is a sensible cadence. Routine `--full` passes are not part of the
+regimen: continuous repair (below) covers drift in channel history and thread
+structure, so `--full` is for "make it correct *now*", for one-shot re-renders
+after upgrades, and — occasionally, at whatever rhythm feels right — for the
+one drift the repair sweep cannot see: edits to old thread replies. Overlapping runs
+are harmless: a second `sync` finds `archive.lock` held and exits 0. A crashed
+run changes nothing, because all of a run's writes commit as a single
+transaction at the end; re-running is always safe.
 
 An interactive run draws a one-line progress ticker — which conversation,
 which thread, which download — and wipes it before the report prints. It goes
@@ -339,8 +343,43 @@ Thread replies have a structural wrinkle: a new reply to an old thread leaves
 no trace in a windowed history fetch. `sync` re-asks every thread whose parent
 appeared in the window with moved reply counts, and every thread with any
 archived activity inside the window. What that still misses — a thread silent
-for longer than the recheck window coming back to life — is picked up by the
-next `--full` run.
+for longer than the recheck window coming back to life — is caught when the
+repair sweep re-serves its parent, within a lap.
+
+### Continuous repair: the sweep, the name rota, the roster
+
+Beyond the recheck window, every run repairs a fixed-size slice of older
+history. A per-conversation cursor walks from the recheck boundary toward the
+first message, re-reading one page per run (`--sweep` pages of 200, default 1),
+and wraps when it reaches the end — one full pass is a *lap*. A re-served page
+is a re-verification: old edits land, display-name changes re-render stored
+text, deletions are marked with the same evidence conservatism scoped to the
+slice, and re-served thread parents whose reply counts moved get their threads
+re-read. The staleness guarantee is bounded by construction for everything a
+history page can witness: **every channel-level message is re-verified against
+Slack within one lap**, and thread *structure* with it — a new or deleted
+reply moves its parent's reply count, which triggers a re-read of the whole
+thread, bodies included.
+
+What a lap cannot see is an edit to an old reply that moves nothing else:
+Slack serves reply bodies only through per-thread reads, and re-reading every
+thread every lap is exactly the unbounded cost the sweep exists to avoid. That
+one category of drift — edited text, or a stale rendered name, on a reply in a
+long-settled thread — waits for a manual `--full`.
+
+Alongside the sweep, each run re-checks one display name (the stalest, once
+older than a day) and reconciles the conversation roster, so a conversation
+the bot loses access to is marked gone within a run — softly, and it un-marks
+itself the moment it is listed again.
+
+The per-run cost is constant no matter how large the archive grows: one extra
+history request per conversation, replies requests only where reply counts
+actually moved, and one `users.info`. Only the lap time grows with volume — a
+1,000-message conversation laps in about five runs, a 100,000-message one in
+about five hundred, at the same per-run price. Compare `--full`, whose single
+run grows linearly and arrives all at once. `--sweep 0` (or `SWEEP_PAGES=0` in
+the config) switches continuous repair off, name rota included; `--full` still
+resets every sweep cursor, since it just did a whole lap in one sitting.
 
 ### Media
 
@@ -501,10 +540,15 @@ per run, so a long fetch degrades into slowness rather than failure.
   readable and searchable after Slack stops serving it.
 - **Substring search only** — see above. Archive search is index-accelerated
   but has identical semantics by construction.
-- **A revived old thread can lag the archive.** New replies to a thread that
-  has been silent longer than the `--recheck` window leave no trace in a
-  windowed history fetch, so an incremental `sync` cannot see them; the next
-  `--full` run picks them up.
+- **A revived old thread can lag the archive** by up to one sweep lap: new
+  replies to a thread silent longer than the `--recheck` window leave no trace
+  in a windowed history fetch, so they surface when the repair sweep re-serves
+  the parent.
+- **An edited old reply is the one drift no lap repairs.** An edit to a reply
+  moves neither `reply_count` nor `latest_reply`, and history pages never
+  carry reply bodies, so the sweep has nothing to notice it by. Reply
+  *deletions* are caught (the count moves); reply *edits* in threads outside
+  the recheck window land on the next `--full`.
 - **Thread expansion costs a request per thread** on live reads. The `--limit`
   cap bounds it; `--no-threads` removes it.
 - **`channels` costs a request per conversation** for true last activity —

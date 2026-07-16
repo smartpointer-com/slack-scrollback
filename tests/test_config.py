@@ -364,3 +364,37 @@ class TestResolveMediaSettings:
     def test_negative_max_bytes_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(ConfigError):
             self._resolve(tmp_path, max_bytes_flag=-1)
+
+
+class TestResolveSweepPages:
+    """Precedence must mirror the media settings': flag, config file, default."""
+
+    def _resolve(self, tmp_path: Path, text: str = "", *, flag: int | None = None) -> int:
+        from slack_scrollback.config import resolve_sweep_pages
+
+        cfg = _cfg(tmp_path, text) if text else tmp_path / "missing.cfg"
+        return resolve_sweep_pages(flag=flag, config_path=cfg, environ={})
+
+    def test_the_default_is_one_page(self, tmp_path: Path) -> None:
+        """Continuous repair is on out of the box: one slice per conversation per run."""
+        assert self._resolve(tmp_path) == 1
+
+    def test_flag_beats_the_config_file(self, tmp_path: Path) -> None:
+        assert self._resolve(tmp_path, "SWEEP_PAGES=3", flag=5) == 5
+
+    def test_the_config_file_supplies_the_count(self, tmp_path: Path) -> None:
+        assert self._resolve(tmp_path, "SWEEP_PAGES=3") == 3
+
+    def test_zero_from_the_flag_turns_repair_off(self, tmp_path: Path) -> None:
+        """0 is a choice, not an absence — it must win over the default, not fall through to it."""
+        assert self._resolve(tmp_path, flag=0) == 0
+
+    def test_a_negative_count_is_refused_naming_the_flag(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError) as caught:
+            self._resolve(tmp_path, flag=-1)
+        assert "--sweep" in str(caught.value)
+
+    def test_a_non_numeric_config_value_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError) as caught:
+            self._resolve(tmp_path, "SWEEP_PAGES=often")
+        assert "SWEEP_PAGES" in str(caught.value)

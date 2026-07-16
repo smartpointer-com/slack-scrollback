@@ -18,6 +18,7 @@ import pytest
 import slack_scrollback.archive as archive_module
 from slack_scrollback.archive import (
     HOUSEKEEPING_SUBTYPES,
+    SCHEMA_VERSION,
     Archive,
     fts5_trigram_available,
     resolve_media_path,
@@ -139,8 +140,8 @@ def test_open_rw_builds_the_whole_archive_in_one_step(tmp_path: Path) -> None:
     assert {"meta", "conversations", "users", "messages", "files", "message_files", "sync_state"} <= tables
     views = {str(row["name"]) for row in run_sql(opened, "SELECT name FROM sqlite_master WHERE type='view'")}
     assert "messages_flat" in views
-    assert run_sql(opened, "PRAGMA user_version")[0][0] == 1
-    assert opened.get_meta("schema_version") == "1"
+    assert run_sql(opened, "PRAGMA user_version")[0][0] == SCHEMA_VERSION
+    assert opened.get_meta("schema_version") == str(SCHEMA_VERSION)
     opened.close()
 
 
@@ -156,7 +157,7 @@ def test_reopening_an_existing_archive_changes_nothing(tmp_path: Path) -> None:
     first.close()
     again = Archive.open_rw(tmp_path)
     assert [str(row["text"]) for row in run_sql(again, "SELECT text FROM messages")] == ["still here"]
-    assert run_sql(again, "PRAGMA user_version")[0][0] == 1
+    assert run_sql(again, "PRAGMA user_version")[0][0] == SCHEMA_VERSION
     again.close()
 
 
@@ -172,7 +173,7 @@ def test_a_newer_schema_is_refused_by_every_opener(tmp_path: Path, opener: Calla
     """Guessing at a future schema could corrupt it; the only safe move is to name the fix."""
     Archive.open_rw(tmp_path).close()
     bump = sqlite3.connect(tmp_path / "archive.db")
-    bump.execute("PRAGMA user_version = 2")
+    bump.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
     bump.commit()
     bump.close()
     with pytest.raises(ScrollbackError) as caught:
@@ -699,3 +700,44 @@ def test_open_rw_in_an_uncreatable_directory_explains_instead_of_tracing(tmp_pat
     finally:
         parent.chmod(0o700)
     assert "cannot write to the archive directory" in str(caught.value)
+
+
+# -- schema migration -------------------------------------------------------------
+
+
+def test_a_v1_archive_upgrades_in_place_with_data_intact(tmp_path: Path) -> None:
+    """The field has v1 archives; opening one must add the sweep columns and
+    bump both version stamps without touching a single stored row."""
+    import sqlite3
+
+    from slack_scrollback.archive import MIGRATIONS
+
+    con = sqlite3.connect(tmp_path / "archive.db", isolation_level=None)
+    con.executescript("BEGIN;\n" + MIGRATIONS[0] + "\nCOMMIT;")
+    con.execute(
+        "INSERT INTO messages (channel_id, ts, ts_epoch, sender_name, text, raw, first_seen_at) "
+        "VALUES ('C0EXAMPLE1', '100.000001', 100.000001, 'alice', 'kept', '{}', 1.0)"
+    )
+    con.execute("INSERT INTO sync_state (channel_id, last_ts) VALUES ('C0EXAMPLE1', '100.000001')")
+    con.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('team_url', 'https://acme.slack.com')")
+    con.close()
+
+    archive = Archive.open_rw(tmp_path)
+    assert run_sql(archive, "PRAGMA user_version")[0][0] == SCHEMA_VERSION
+    assert archive.get_meta("schema_version") == str(SCHEMA_VERSION)
+    assert archive.get_meta("team_url") == "https://acme.slack.com"
+    assert archive.last_ts("C0EXAMPLE1") == "100.000001"
+    assert [str(r["text"]) for r in run_sql(archive, "SELECT text FROM messages")] == ["kept"]
+    assert archive.sweep_state("C0EXAMPLE1") == (None, None)
+
+
+def test_exclusive_top_excludes_the_boundary_row(tmp_path: Path) -> None:
+    """latest_inclusive=False is the sweep's contract: the row AT the bound
+    belongs to the previous slice and must not be expected of this one."""
+    archive = Archive.open_rw(tmp_path)
+    for ts in ("100.000001", "200.000001", "300.000001"):
+        put_message(archive, ts=ts)
+    inclusive = archive.channel_level_ts_between("C0EXAMPLE1", 100.0, 200.000001)
+    exclusive = archive.channel_level_ts_between("C0EXAMPLE1", 100.0, 200.000001, latest_inclusive=False)
+    assert inclusive == {"100.000001", "200.000001"}
+    assert exclusive == {"100.000001"}

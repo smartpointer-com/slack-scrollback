@@ -17,7 +17,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from .api import DEFAULT_PAGE_LIMIT, SlackClient
+from .api import DEFAULT_PAGE_LIMIT, MAX_PAGES, SlackClient
 from .errors import SlackApiError, UsageError
 
 # Conversation kinds, in the order `channels` lists them.
@@ -208,6 +208,7 @@ class Workspace:
         self._users: dict[str, str] = {}
         self._channel_names: dict[str, str] = {}
         self._conversations: list[Conversation] | None = None
+        self._listing_complete = True
         self._team_url: str | None = None
 
     # -- names -------------------------------------------------------------
@@ -267,6 +268,16 @@ class Workspace:
         """Every name resolved or seeded so far this run."""
         return dict(self._users)
 
+    def refresh_user_name(self, user_id: str) -> str:
+        """Resolve a name from Slack even if a cached or seeded one exists.
+
+        The cache exists to avoid re-asking; this is for the caller whose whole
+        point is re-asking — the rename check. A failed lookup falls back to
+        the raw ID exactly as first resolution does.
+        """
+        self._users.pop(user_id, None)
+        return self.user_name(user_id)
+
     def channel_name(self, channel_id: str) -> str:
         """Name for a channel ID, for rendering ``<#C…>`` mentions.
 
@@ -306,16 +317,27 @@ class Workspace:
             return self._conversations
 
         conversations: list[Conversation] = []
-        for raw in self._client.paginate(
+        pages = 0
+        for body in self._client.iter_pages(
             "conversations.list",
-            "channels",
             limit=DEFAULT_PAGE_LIMIT,
             types=_ALL_TYPES,
             exclude_archived="false",
         ):
-            conversations.append(self._to_conversation(raw))
+            pages += 1
+            for raw in body.get("channels") or []:
+                conversations.append(self._to_conversation(raw))
+        # iter_pages stops silently at its backstop; a listing that long is
+        # not known to be the whole roster, and "vanished from the roster"
+        # inferences must not run on a roster that merely got truncated.
+        self._listing_complete = pages < MAX_PAGES
         self._conversations = conversations
         return conversations
+
+    @property
+    def conversations_listing_complete(self) -> bool:
+        """Whether ``all_conversations`` saw the roster to its end."""
+        return self._listing_complete
 
     def _to_conversation(self, raw: dict[str, Any]) -> Conversation:
         kind = _kind_of(raw)
@@ -406,6 +428,24 @@ class Workspace:
                 throttled = page_limit > _THROTTLE_CAP and len(messages) == _THROTTLE_CAP and bool(body.get("has_more"))
                 first = False
             yield body, throttled
+
+    def history_slice(
+        self, conversation: Conversation, *, latest: str, limit: int
+    ) -> tuple[list[dict[str, Any]], bool, bool]:
+        """One page of history strictly older than ``latest``: (messages, has_more, throttled).
+
+        Exactly one request, no cursor-following — this is the repair sweep's
+        fixed-size slice, and following ``has_more`` here would turn a bounded
+        budget into a whole-history read. ``latest`` is sent *without*
+        ``inclusive``, so it is an exclusive bound (verified live): a cursor
+        set to the previous slice's oldest served ts tiles history with no
+        gap and no double-fetch.
+        """
+        body = self._client.call("conversations.history", channel=conversation.id, latest=latest, limit=limit)
+        messages = list(body.get("messages") or [])
+        has_more = bool(body.get("has_more"))
+        throttled = limit > _THROTTLE_CAP and len(messages) == _THROTTLE_CAP and has_more
+        return messages, has_more, throttled
 
     def fetch_history(
         self,

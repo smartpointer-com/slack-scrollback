@@ -745,3 +745,47 @@ def test_run_exits_with_mains_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(SystemExit) as caught:
         cli.run()
     assert caught.value.code == 1
+
+
+# -- sync: the --sweep knob ------------------------------------------------------
+
+
+def test_sync_sweep_zero_runs_and_reports_zero_pages(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], arch_dir: Path
+) -> None:
+    """``--sweep 0`` is a supported operating mode: the run succeeds, fetches
+    no repair slice, and the JSON summary says repair did not run rather than
+    hiding it."""
+    fake = base_fake(with_file=False)
+    transport, _ = install_live_client(monkeypatch, fake.handlers())
+    code = cli.main(["sync", "--media", "none", "--sweep", "0", "--json"])
+    out = capsys.readouterr().out
+    assert code == 0
+    records = [json.loads(line) for line in out.splitlines()]
+    summary = next(r for r in records if r["type"] == "summary")
+    assert summary["sweep"]["pages"] == 0
+    assert summary["sweep"]["lap_completed"] is False
+    slices = [c for c in transport.calls if c.method == "conversations.history" and "inclusive" not in c.params]
+    assert slices == []
+
+
+def test_sync_rejects_a_negative_sweep(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """A configuration refusal must not cost a network round-trip — the error
+    lands before any client exists, naming the flag to fix."""
+    forbid_client(monkeypatch)
+    code = cli.main(["sync", "--sweep", "-1"])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "--sweep" in err
+
+
+def test_sync_performs_repair_slices_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No flag, no config key: continuous repair is on at the CLI layer.
+    Slice fetches are the history calls without ``inclusive`` — the window
+    always sends it, the sweep never does."""
+    fake = base_fake(with_file=False)
+    transport, _ = install_live_client(monkeypatch, fake.handlers())
+    code = cli.main(["sync", "--media", "none"])
+    assert code == 0
+    slices = [c for c in transport.calls if c.method == "conversations.history" and "inclusive" not in c.params]
+    assert slices

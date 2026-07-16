@@ -32,7 +32,7 @@ from urllib.parse import urlsplit
 from . import __version__
 from .api import SlackClient
 from .archive import Archive, archive_exists, sync_lock
-from .config import resolve_archive_dir, resolve_media_settings, resolve_token
+from .config import resolve_archive_dir, resolve_media_settings, resolve_sweep_pages, resolve_token
 from .download import download_to, sanitized_filename
 from .errors import ScrollbackError, UsageError
 from .format import LocalPathLookup, link_key, render_channels, render_messages
@@ -212,6 +212,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         metavar="N",
         help="skip files larger than this many bytes (default: no limit)",
+    )
+    sync.add_argument(
+        "--sweep",
+        type=int,
+        metavar="N",
+        help="pages of older history re-verified per conversation per run; the cursor walks to the oldest "
+        "message and wraps (one full pass is a lap). 0 turns continuous repair off (default: 1)",
     )
     sync.add_argument(
         "--quiet",
@@ -591,6 +598,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         tiers_flag=args.media, max_bytes_flag=args.media_max_bytes, config_path=_config_path(args)
     )
     recheck = parse_duration(args.recheck, flag="--recheck")
+    sweep_pages = resolve_sweep_pages(flag=args.sweep, config_path=_config_path(args))
     ticker = Ticker(sys.stderr) if not args.quiet and sys.stderr.isatty() else None
 
     with sync_lock(directory) as acquired:
@@ -612,6 +620,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             recheck_seconds=recheck,
             media_tiers=tiers,
             media_max_bytes=max_bytes,
+            sweep_pages=sweep_pages,
             timeout=args.timeout,
             progress=ticker,
         )

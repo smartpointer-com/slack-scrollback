@@ -610,18 +610,25 @@ def test_a_full_run_rerenders_sender_names_an_incremental_run_leaves_stale(tmp_p
     assert stored_message(archive, ts)["sender_name"] == "alexandra"
 
 
-def test_a_dropped_conversation_is_marked_gone_only_by_a_full_run(tmp_path: Path) -> None:
-    """An incremental run cannot tell "gone" from "not looked at", so only --full draws the conclusion."""
-    fake = FakeSlack(channels=[channel(), channel(OTHER_CHANNEL, "random")])
+def test_a_dropped_conversation_is_marked_gone_on_any_run(tmp_path: Path) -> None:
+    """Reconciling the roster is an every-run repair now: the listing is
+    fetched every run anyway, gone_at is soft, and a re-listed conversation
+    un-marks itself — so there is nothing to save for --full."""
+    dropped = channel(OTHER_CHANNEL, "random")
+    fake = FakeSlack(channels=[channel(), dropped])
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY))]
     run_sync(fake, tmp_path)
 
     fake.channels = [channel()]
-    _, archive, _ = run_sync(fake, tmp_path)
-    assert rows(archive, "SELECT gone_at FROM conversations WHERE id = ?", OTHER_CHANNEL)[0]["gone_at"] is None
-
-    report, archive, _ = run_sync(fake, tmp_path, full=True)
-    assert rows(archive, "SELECT gone_at FROM conversations WHERE id = ?", OTHER_CHANNEL)[0]["gone_at"] is not None
+    report, archive, _ = run_sync(fake, tmp_path)
+    row = rows(archive, "SELECT * FROM conversations WHERE id = ?", OTHER_CHANNEL)[0]
+    assert row["gone_at"] is not None
     assert any("no longer visible" in note for note in report.notes)
+
+    fake.channels = [channel(), dropped]
+    _, archive, _ = run_sync(fake, tmp_path)
+    row = rows(archive, "SELECT * FROM conversations WHERE id = ?", OTHER_CHANNEL)[0]
+    assert row["gone_at"] is None
 
 
 def test_a_full_run_stamps_last_full_at(tmp_path: Path) -> None:
@@ -936,3 +943,448 @@ def test_the_slackbot_dm_is_rostered_but_never_fetched(tmp_path: Path) -> None:
     assert len(listed) == 1
     assert report.notes == []
     assert all(c.name != "@Slackbot" for c in report.conversations)
+
+
+# -- the repair sweep: tiling and boundaries --------------------------------------
+
+
+def sweep_slice_calls(transport: Any) -> list[str]:
+    """The `latest` bound of each sweep slice this run.
+
+    Slice fetches are the history calls WITHOUT `inclusive` — the window
+    always sends inclusive=true; the sweep never does, because its tiling
+    depends on the exclusive bound.
+    """
+    return [
+        str(c.params["latest"])
+        for c in transport.calls
+        if c.method == "conversations.history" and "inclusive" not in c.params
+    ]
+
+
+def old_days(*days: int) -> list[dict[str, Any]]:
+    return [message(ts_at(d * DAY), f"day {d}") for d in days]
+
+
+def test_sweep_slices_tile_history_without_gap_overlap_or_false_gone(tmp_path: Path) -> None:
+    """One lap in three slices: each starts exactly where the last ended
+    (exclusive bound), every old message is re-verified exactly once, and —
+    the §8 boundary case — the previous slice's oldest message is never
+    falsely gone-marked by the next slice's deletion diff."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [*old_days(1, 2, 3, 4, 5, 6, 7), message(ts_at(29 * DAY), "recent")]
+    day = {d: ts_at(d * DAY) for d in range(1, 8)}
+    lap_start = f"{NOW - 7 * DAY:.6f}"
+
+    _, archive, transport = run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=3)
+    assert sweep_slice_calls(transport) == [lap_start]
+    assert archive.sweep_state(CHANNEL) == (day[5], None)
+
+    _, archive, transport = run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=3)
+    assert sweep_slice_calls(transport) == [day[5]]
+    assert archive.sweep_state(CHANNEL) == (day[2], None)
+
+    report, archive, transport = run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=3)
+    assert sweep_slice_calls(transport) == [day[2]]
+    before, lap_at = archive.sweep_state(CHANNEL)
+    assert before is None and lap_at == NOW
+    assert report.sweep_lap_completed
+
+    gone = rows(archive, "SELECT ts FROM messages WHERE gone_at IS NOT NULL")
+    assert gone == []
+
+    # The next run wraps: a fresh lap starts back at the recheck boundary.
+    _, _, transport = run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=3)
+    assert sweep_slice_calls(transport) == [lap_start]
+
+
+def test_deep_edits_and_deletions_land_on_the_lap_that_reaches_them(tmp_path: Path) -> None:
+    """The bounded-staleness promise, concretely: an old edit lands when its
+    slice is served, an old deletion is marked when its slice's evidence
+    covers it — and neither happens a run earlier."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [*old_days(1, 2, 3, 4, 5, 6, 7), message(ts_at(29 * DAY), "recent")]
+    day = {d: ts_at(d * DAY) for d in range(1, 8)}
+    for _ in range(3):  # complete one clean lap
+        run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=3)
+
+    fake.messages[CHANNEL] = [
+        m
+        for m in fake.messages[CHANNEL]
+        if str(m["ts"]) != day[3]  # deleted deep in history
+    ]
+    for m in fake.messages[CHANNEL]:
+        if str(m["ts"]) == day[6]:
+            m["text"] = "day 6, corrected"
+            m["edited"] = {"ts": ts_at(29 * DAY + 60)}
+
+    report, archive, _ = run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=3)
+    assert stored_message(archive, day[6])["text"] == "day 6, corrected"
+    assert summary_of(report).edited == 1
+    assert stored_message(archive, day[3])["gone_at"] is None  # slice has not reached it yet
+
+    report, archive, _ = run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=3)
+    assert stored_message(archive, day[3])["gone_at"] is not None
+    assert summary_of(report).gone == 1
+    assert stored_message(archive, day[2])["gone_at"] is None
+    assert stored_message(archive, day[4])["gone_at"] is None
+
+
+# -- the repair sweep: revived threads and the fixed budget ------------------------
+
+
+def test_a_revived_thread_is_caught_on_the_run_whose_slice_serves_its_parent(tmp_path: Path) -> None:
+    """A reply to a thread silent longer than the recheck window leaves no
+    trace in any windowed response; the sweep re-serving the parent is the
+    designed catch. The replies call must land on exactly the run whose slice
+    contains the parent — an earlier slice holds no evidence, and asking
+    without evidence is what the fixed budget forbids."""
+    parent_ts = ts_at(2 * DAY)
+    first_reply = ts_at(2 * DAY + 60)
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [
+        message(ts_at(1 * DAY), "day 1"),
+        thread_parent(parent_ts, reply_count=1, latest_reply=first_reply),
+        message(ts_at(3 * DAY), "day 3"),
+        message(ts_at(4 * DAY), "day 4"),
+        message(ts_at(5 * DAY), "day 5"),
+        message(ts_at(29 * DAY), "recent"),
+    ]
+    fake.threads[(CHANNEL, parent_ts)] = [thread_reply(parent_ts, first_reply)]
+    for _ in range(3):  # one complete lap: [day5, day4], [day3, parent], [day1]
+        run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=2)
+
+    revival = ts_at(29 * DAY + 300)
+    for m in fake.messages[CHANNEL]:
+        if str(m["ts"]) == parent_ts:
+            m["reply_count"] = 2
+            m["latest_reply"] = revival
+    fake.threads[(CHANNEL, parent_ts)].append(thread_reply(parent_ts, revival, "thread revival"))
+
+    _, archive, transport = run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=2)
+    assert "conversations.replies" not in transport.methods  # this slice served day5/day4 only
+    assert stored_message(archive, revival) is None
+
+    report, archive, transport = run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=2)
+    asked = [c.params.get("ts") for c in transport.calls if c.method == "conversations.replies"]
+    assert asked == [parent_ts]
+    assert stored_message(archive, revival)["thread_ts"] == parent_ts
+    assert summary_of(report).new == 1
+
+
+def test_a_slice_full_of_unchanged_parents_triggers_zero_replies_calls(tmp_path: Path) -> None:
+    """The ``active_thread_ts`` union is deliberately absent from the sweep:
+    over a slice it would re-ask every historical thread the slice touches and
+    the fixed budget would explode. Unmoved counters must cost nothing — and
+    the parents sit far below the recheck window, so the window's own
+    recent-thread recheck cannot contribute calls either."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = []
+    for d in range(1, 6):
+        pts = ts_at(d * DAY)
+        reply = ts_at(d * DAY + 60)
+        fake.messages[CHANNEL].append(thread_parent(pts, reply_count=1, latest_reply=reply))
+        fake.threads[(CHANNEL, pts)] = [thread_reply(pts, reply)]
+    fake.messages[CHANNEL].append(message(ts_at(29 * DAY), "keeps the cursor recent"))
+    run_sync(fake, tmp_path, sweep_pages=1)  # the seeding run legitimately fetches every thread once
+
+    for _ in range(2):  # every later run laps a slice made entirely of settled parents
+        report, _, transport = run_sync(fake, tmp_path, sweep_pages=1)
+        assert "conversations.replies" not in transport.methods
+        assert report.sweep_lap_completed  # honest: the slice really did re-serve the parents
+
+
+def test_a_throttled_run_pauses_the_sweep_and_notes_it_once(tmp_path: Path) -> None:
+    """Under the silent 15-message cap every request is precious: the window
+    work runs, the sweep fetches not a single slice, and one note — not one
+    per conversation — says the lap paused."""
+    fake = FakeSlack(channels=[channel(), channel(OTHER_CHANNEL, "random")])
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY + i), f"m{i}") for i in range(15)]
+    fake.messages[OTHER_CHANNEL] = [message(ts_at(28 * DAY + i), f"r{i}") for i in range(15)]
+    original = fake._history
+
+    def capped(params: dict[str, str]) -> dict[str, Any]:
+        body = original(params)
+        body["messages"] = body["messages"][:15]
+        body["has_more"] = True
+        return body
+
+    handlers = fake.handlers()
+    handlers["conversations.history"] = capped
+    from slack_scrollback.archive import Archive
+    from slack_scrollback.syncer import Syncer
+    from slack_scrollback.workspace import Workspace
+    from tests.conftest import TOKEN, make_client
+
+    client, transport = make_client(handlers)
+    archive = Archive.open_rw(tmp_path)
+    report = Syncer(Workspace(client), client, archive, token=TOKEN, sweep_pages=1, now_fn=lambda: NOW).run()
+
+    assert report.throttled
+    assert sweep_slice_calls(transport) == []
+    assert len([n for n in report.notes if "repair sweep was skipped" in n]) == 1
+    assert report.sweep_lap_completed is False
+    # "The critical window work must stay cheap" — cheap, not skipped: both
+    # conversations' window messages are archived despite the pause, including
+    # the one whose sync began after throttling was first detected.
+    stored = {str(r["text"]) for r in rows(archive, "SELECT text FROM messages")}
+    assert {"m0", "m14", "r0", "r14"} <= stored
+
+
+def test_a_full_run_resets_the_sweep_cursor_without_fetching_slices(tmp_path: Path) -> None:
+    """``--full`` re-reads everything Slack still serves: that IS a lap, so a
+    slice fetch on top would be waste — and the cursor must restart cleanly
+    so the next incremental run begins a fresh lap."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [*old_days(1, 2, 3, 4, 5, 6, 7), message(ts_at(29 * DAY), "recent")]
+    _, archive, _ = run_sync(fake, tmp_path, sweep_pages=1, sweep_page_size=3)
+    assert archive.sweep_state(CHANNEL) == (ts_at(5 * DAY), None)  # mid-lap
+
+    _, archive, transport = run_sync(fake, tmp_path, full=True, sweep_pages=1, now=NOW + 3600)
+    assert sweep_slice_calls(transport) == []
+    assert archive.sweep_state(CHANNEL) == (None, NOW + 3600)
+
+
+def test_an_empty_slice_marks_nothing_and_still_completes_the_lap(tmp_path: Path) -> None:
+    """A slice served empty is exactly what a retention policy hiding old
+    history looks like; the archive exists to outlive retention, so nothing
+    may be marked — but the lap must complete rather than jam on the silence."""
+    old_one, old_two = message(ts_at(1 * DAY), "old one"), message(ts_at(2 * DAY), "old two")
+    recent = message(ts_at(29 * DAY), "window evidence")
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [old_one, old_two, recent]
+    run_sync(fake, tmp_path, sweep_pages=1)
+
+    fake.messages[CHANNEL] = [recent]  # retention hid the old stretch, from the API's view
+    report, archive, _ = run_sync(fake, tmp_path, sweep_pages=1)
+
+    assert stored_message(archive, str(old_one["ts"]))["gone_at"] is None
+    assert stored_message(archive, str(old_two["ts"]))["gone_at"] is None
+    assert summary_of(report).gone == 0
+    assert report.sweep_lap_completed is True
+    assert archive.sweep_state(CHANNEL) == (None, NOW)
+
+
+def test_a_conversation_smaller_than_one_page_laps_every_run(tmp_path: Path) -> None:
+    """One slice per run at the lap start, lap complete every time: accepted
+    as cheaper than special-casing tiny conversations, and the recorded state
+    must say so on every run."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [message(ts_at(1 * DAY), "the only message")]
+
+    _, archive, transport = run_sync(fake, tmp_path, sweep_pages=1)
+    assert sweep_slice_calls(transport) == [f"{NOW - 7 * DAY:.6f}"]
+    assert archive.sweep_state(CHANNEL) == (None, NOW)
+
+    later = NOW + 3600
+    report, archive, transport = run_sync(fake, tmp_path, sweep_pages=1, now=later)
+    assert sweep_slice_calls(transport) == [f"{later - 7 * DAY:.6f}"]
+    assert archive.sweep_state(CHANNEL) == (None, later)
+    assert report.sweep_lap_completed is True
+
+
+def test_two_sweep_pages_fetch_two_chained_slices_in_one_run(tmp_path: Path) -> None:
+    """``--sweep 2`` buys two slices per run, and they must tile exactly as
+    two consecutive runs would: the second slice's latest bound is the first
+    slice's oldest served message."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [*old_days(1, 2, 3, 4, 5, 6, 7), message(ts_at(29 * DAY), "recent")]
+
+    report, archive, transport = run_sync(fake, tmp_path, sweep_pages=2, sweep_page_size=3)
+    assert sweep_slice_calls(transport) == [f"{NOW - 7 * DAY:.6f}", ts_at(5 * DAY)]
+    assert archive.sweep_state(CHANNEL) == (ts_at(2 * DAY), None)
+    assert report.sweep_pages == 2
+
+
+# -- the users micro-rota ------------------------------------------------------------
+
+
+def test_the_rota_refreshes_exactly_the_stalest_user_each_run(tmp_path: Path) -> None:
+    """One ``users.info`` per run, spent on the name unchecked longest — and
+    the bump must be recorded, or the rota would re-ask the same user instead
+    of rotating through the roster."""
+    fake = FakeSlack()
+    fake.users["U0EXAMPLE3"] = "carol"
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY))]
+    _, archive, _ = run_sync(fake, tmp_path, sweep_pages=1)
+    archive.upsert_user("U0EXAMPLE2", "bob", NOW - 3 * DAY)
+    archive.upsert_user("U0EXAMPLE3", "carol", NOW - 5 * DAY)
+
+    _, archive, transport = run_sync(fake, tmp_path, sweep_pages=1)
+    assert [c.params.get("user") for c in transport.calls if c.method == "users.info"] == ["U0EXAMPLE3"]
+    carol = rows(archive, "SELECT * FROM users WHERE id = ?", "U0EXAMPLE3")[0]
+    assert carol["refreshed_at"] == NOW
+
+    _, _, transport = run_sync(fake, tmp_path, sweep_pages=1)
+    assert [c.params.get("user") for c in transport.calls if c.method == "users.info"] == ["U0EXAMPLE2"]
+
+
+def test_users_fresher_than_a_day_earn_no_rota_calls(tmp_path: Path) -> None:
+    """Churning a fresh name is a request spent on nothing; under a day of
+    age the rota stays silent."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY), "ping <@U0EXAMPLE2>")]
+    run_sync(fake, tmp_path, sweep_pages=1)
+
+    _, _, transport = run_sync(fake, tmp_path, sweep_pages=1, now=NOW + 3600)
+    assert "users.info" not in transport.methods
+
+
+def test_a_rename_reaches_the_users_table_and_then_the_rows_via_the_lap(tmp_path: Path) -> None:
+    """The rota's half of a rename is the users table; a stored row's
+    ``sender_name`` may only move when a sweep slice actually re-serves it —
+    that is the bounded-staleness bargain, not an oversight."""
+    old_ts = ts_at(2 * DAY)
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [message(old_ts, "old words"), message(ts_at(29 * DAY), "recent")]
+    run_sync(fake, tmp_path, sweep_pages=1)
+
+    fake.users["U0EXAMPLE1"] = "alexandra"
+    _, archive, transport = run_sync(fake, tmp_path, sweep_pages=1, now=NOW + 2 * DAY)
+    assert [c.params.get("user") for c in transport.calls if c.method == "users.info"] == ["U0EXAMPLE1"]
+    assert archive.user_names()["U0EXAMPLE1"] == "alexandra"
+    assert stored_message(archive, old_ts)["sender_name"] == "alice"  # no slice has re-served it yet
+
+    _, archive, _ = run_sync(fake, tmp_path, sweep_pages=1, now=NOW + 3 * DAY)
+    assert stored_message(archive, old_ts)["sender_name"] == "alexandra"
+
+
+def test_sweep_zero_disables_the_users_rota_too(tmp_path: Path) -> None:
+    """One knob, one concept: repair off means no rota either — and the same
+    stale user earns a call the moment the sweep is back on, proving the
+    silence came from the knob, not from freshness."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY))]
+    run_sync(fake, tmp_path)
+
+    _, _, transport = run_sync(fake, tmp_path, now=NOW + 2 * DAY)  # sweep off: run_sync's default
+    assert "users.info" not in transport.methods
+
+    _, _, transport = run_sync(fake, tmp_path, sweep_pages=1, now=NOW + 2 * DAY)
+    assert [c.params.get("user") for c in transport.calls if c.method == "users.info"] == ["U0EXAMPLE1"]
+
+
+def test_a_dead_account_keeps_its_name_but_does_not_pin_the_rota(tmp_path: Path) -> None:
+    """A failing ``users.info`` (deleted account) must not erase the archived
+    name — and must still advance the clock, or one dead account would pin
+    the rota forever while live renames wait behind it."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY))]
+    _, archive, _ = run_sync(fake, tmp_path, sweep_pages=1)
+    archive.upsert_user("U0EXAMPLE2", "bob", NOW - 6 * DAY)
+    del fake.users["U0EXAMPLE2"]
+
+    _, archive, transport = run_sync(fake, tmp_path, sweep_pages=1, now=NOW + 2 * DAY)
+    assert [c.params.get("user") for c in transport.calls if c.method == "users.info"] == ["U0EXAMPLE2"]
+    bob = rows(archive, "SELECT * FROM users WHERE id = ?", "U0EXAMPLE2")[0]
+    assert bob["name"] == "bob"
+    assert bob["refreshed_at"] == NOW + 2 * DAY
+
+    _, _, transport = run_sync(fake, tmp_path, sweep_pages=1, now=NOW + 3 * DAY)
+    assert [c.params.get("user") for c in transport.calls if c.method == "users.info"] == ["U0EXAMPLE1"]
+
+
+# -- the roster reconcile guard --------------------------------------------------------
+
+
+def test_an_incomplete_roster_listing_suspends_gone_marking(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``paginate()`` stops silently at its backstop; on a roster that long,
+    absence from the listing proves nothing, so gone-marking must stand down
+    for the run and the report must say why."""
+    from slack_scrollback.workspace import Workspace
+
+    dropped = channel(OTHER_CHANNEL, "random")
+    fake = FakeSlack(channels=[channel(), dropped])
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY))]
+    run_sync(fake, tmp_path)
+
+    fake.channels = [channel()]
+    monkeypatch.setattr(Workspace, "conversations_listing_complete", property(lambda self: False))
+    report, archive, _ = run_sync(fake, tmp_path)
+
+    row = rows(archive, "SELECT * FROM conversations WHERE id = ?", OTHER_CHANNEL)[0]
+    assert row["gone_at"] is None
+    assert any("roster was too long" in note for note in report.notes)
+
+
+# -- sweep telemetry -------------------------------------------------------------------
+
+
+def test_sweep_telemetry_counts_slices_and_the_oldest_verified_ts(tmp_path: Path) -> None:
+    """The report is how an operator sizes a lap: pages actually fetched, how
+    deep this run verified, and whether the lap closed — in the dataclass and
+    in the JSON summary alike."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [*old_days(1, 2, 3, 4, 5, 6, 7), message(ts_at(29 * DAY), "recent")]
+
+    report, _, transport = run_sync(fake, tmp_path, sweep_pages=2, sweep_page_size=3)
+    assert report.sweep_pages == len(sweep_slice_calls(transport)) == 2
+    assert report.sweep_oldest_verified == ts_at(2 * DAY)
+    assert report.sweep_lap_completed is False
+    records = [json.loads(line) for line in render_sync_report(report, as_json=True)]
+    summary = next(r for r in records if r["type"] == "summary")
+    assert summary["sweep"] == {"pages": 2, "oldest_verified": ts_at(2 * DAY), "lap_completed": False}
+
+    report, _, transport = run_sync(fake, tmp_path, sweep_pages=2, sweep_page_size=3)
+    assert report.sweep_pages == len(sweep_slice_calls(transport)) == 1  # day 1 ends the lap early
+    assert report.sweep_oldest_verified == ts_at(1 * DAY)
+    assert report.sweep_lap_completed is True
+
+
+def test_sweep_off_reports_zero_pages_and_an_open_lap(tmp_path: Path) -> None:
+    """``--sweep 0`` must be legible in the summary: zero pages, nothing
+    verified, lap not completed — "repair did not run" must never read as
+    "the lap is done"."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY))]
+
+    report, _, transport = run_sync(fake, tmp_path)  # run_sync's default is sweep off
+    assert sweep_slice_calls(transport) == []
+    assert report.sweep_pages == 0
+    assert report.sweep_oldest_verified is None
+    records = [json.loads(line) for line in render_sync_report(report, as_json=True)]
+    summary = next(r for r in records if r["type"] == "summary")
+    assert summary["sweep"] == {"pages": 0, "oldest_verified": None, "lap_completed": False}
+
+
+def test_a_roster_hitting_the_pagination_cap_disables_gone_marking_for_real(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The completeness guard exercised end to end, not via a patched flag: a
+    conversations.list that still has a cursor when the page backstop hits is
+    not the whole roster, and judging absences against it would gone-mark
+    every conversation beyond the cap."""
+    import slack_scrollback.api as api_module
+    import slack_scrollback.workspace as workspace_module
+
+    monkeypatch.setattr(api_module, "MAX_PAGES", 2)
+    monkeypatch.setattr(workspace_module, "MAX_PAGES", 2)
+
+    fake = FakeSlack(channels=[channel(), channel(OTHER_CHANNEL, "random")])
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY))]
+    run_sync(fake, tmp_path)  # both conversations archived under a complete roster
+
+    pages: dict[str, dict[str, Any]] = {
+        "": {"channels": [channel()], "cursor": "page2"},
+        "page2": {"channels": [], "cursor": "page3"},  # OTHER_CHANNEL never listed before the cap
+        "page3": {"channels": [channel(OTHER_CHANNEL, "random")], "cursor": ""},
+    }
+
+    def paginated_list(params: dict[str, Any]) -> dict[str, Any]:
+        page = pages[str(params.get("cursor", ""))]
+        return ok(channels=page["channels"], response_metadata={"next_cursor": page["cursor"]})
+
+    handlers = fake.handlers()
+    handlers["conversations.list"] = paginated_list
+    from slack_scrollback.archive import Archive
+    from slack_scrollback.syncer import Syncer
+    from slack_scrollback.workspace import Workspace
+    from tests.conftest import TOKEN, make_client
+
+    client, _ = make_client(handlers)
+    archive = Archive.open_rw(tmp_path)
+    report = Syncer(Workspace(client), client, archive, token=TOKEN, sweep_pages=0, now_fn=lambda: NOW + 60).run()
+
+    unlisted = rows(archive, "SELECT * FROM conversations WHERE id = ?", OTHER_CHANNEL)[0]
+    assert unlisted["gone_at"] is None
+    assert any("roster was too long" in note for note in report.notes)

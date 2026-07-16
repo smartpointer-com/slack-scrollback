@@ -241,11 +241,28 @@ class FakeSlack:
         }
 
     def _history(self, params: dict[str, str]) -> dict[str, Any]:
+        """Model the parts of conversations.history the tool depends on.
+
+        ``latest`` is exclusive unless ``inclusive=true`` rides along — the
+        repair sweep's slice tiling rests on exactly that (verified live) —
+        and ``limit``/``has_more`` behave like Slack's, so a big conversation
+        genuinely takes several slices to lap.
+        """
         oldest = float(params.get("oldest", "0"))
         latest = float(params.get("latest", "9999999999"))
-        found = [m for m in self.messages.get(params.get("channel", ""), []) if oldest <= float(str(m["ts"])) <= latest]
-        found.sort(key=lambda m: float(str(m["ts"])), reverse=True)
-        return ok(messages=found, has_more=False)
+        inclusive = params.get("inclusive") == "true"
+
+        def in_window(m: dict[str, Any]) -> bool:
+            epoch = float(str(m["ts"]))
+            return oldest <= epoch and (epoch <= latest if inclusive else epoch < latest)
+
+        found = sorted(
+            (m for m in self.messages.get(params.get("channel", ""), []) if in_window(m)),
+            key=lambda m: float(str(m["ts"])),
+            reverse=True,
+        )
+        limit = int(params.get("limit", "100"))
+        return ok(messages=found[:limit], has_more=len(found) > limit)
 
     def _replies(self, params: dict[str, str]) -> dict[str, Any]:
         channel_id, thread_ts = params.get("channel", ""), params.get("ts", "")
@@ -296,11 +313,16 @@ def run_sync(
     media_tiers: frozenset[str] = frozenset(),
     media_max_bytes: int | None = None,
     downloads: FakeFileHost | None = None,
+    sweep_pages: int = 0,
+    sweep_page_size: int = 200,
 ) -> tuple[Any, Any, FakeTransport]:
     """One sync run; returns ``(report, archive, transport)``.
 
     The archive connection is left open for assertions. Call again with the
     same directory (after mutating ``fake``) for an incremental follow-up run.
+    The repair sweep is OFF by default here, unlike production: most tests
+    assert exact windows and call counts, and a sweep slice underneath them
+    would couple every assertion to the sweep schedule. Sweep tests opt in.
     """
     from pathlib import Path
 
@@ -319,6 +341,8 @@ def run_sync(
         recheck_seconds=recheck_seconds,
         media_tiers=media_tiers,
         media_max_bytes=media_max_bytes,
+        sweep_pages=sweep_pages,
+        sweep_page_size=sweep_page_size,
         now_fn=lambda: now,
         download_transport=downloads,
     )

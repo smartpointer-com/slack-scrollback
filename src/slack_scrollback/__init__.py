@@ -2,7 +2,7 @@
 
 import sys
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Checked here because this module is the first thing any entry point imports.
 #
