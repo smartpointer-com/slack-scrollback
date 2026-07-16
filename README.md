@@ -69,11 +69,11 @@ account or daemon — whose `PATH` is not yours.
 ### Working on the tool
 
 ```sh
-make install     # creates .venv and installs the package plus pinned dev tools
-make all         # install + lint + test + build
+make venv        # creates .venv with the package (editable) and pinned dev tools
+make all         # lint + test + build (creating .venv as needed)
 ```
 
-`make` is the only entry point: `install`, `build`, `lint`, `test`, `fmt`,
+`make` is the only entry point: `venv`, `build`, `lint`, `test`, `fmt`,
 `clean`, `all`. During development `.venv/bin/slack-scrollback` runs the code in
 place, without rebuilding.
 
@@ -263,6 +263,14 @@ minutes is a sensible cadence, with a `--full` pass every week or so.
 Overlapping runs are harmless: a second `sync` finds `archive.lock` held and
 exits 0. A crashed run changes nothing, because all of a run's writes commit as
 a single transaction at the end; re-running is always safe.
+
+An interactive run draws a one-line progress ticker — which conversation,
+which thread, which download — and wipes it before the report prints. It goes
+to stderr, the diagnostic channel, so `--json | jq` and `> report` stay clean;
+it only appears when stderr is a terminal, so scheduled runs log nothing but
+the report; and `--quiet` turns it off outright. (One conversation never
+appears in it: the Slackbot DM stays in the roster but is not fetched, because
+Slack refuses to serve its history to any bot token.)
 
 ### Where it lives
 
@@ -520,7 +528,7 @@ documentation.
 ## Development
 
 ```sh
-make all      # install + lint + test
+make all      # lint + test + build
 make test     # pytest — no network; the HTTP layer is stubbed throughout
 make lint     # ruff + ruff format --check + mypy --strict
 make fmt      # apply formatting and autofixes

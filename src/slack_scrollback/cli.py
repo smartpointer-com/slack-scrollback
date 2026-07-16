@@ -22,10 +22,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 from urllib.parse import urlsplit
 
 from . import __version__
@@ -211,6 +212,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         metavar="N",
         help="skip files larger than this many bytes (default: no limit)",
+    )
+    sync.add_argument(
+        "--quiet",
+        action="store_true",
+        help="no progress ticker (it is already off when stderr is not a terminal)",
     )
     sync.set_defaults(handler=cmd_sync)
 
@@ -543,12 +549,49 @@ def cmd_search(args: argparse.Namespace) -> int:
     )
 
 
+class Ticker:
+    """A one-line progress ticker, rewritten in place on stderr.
+
+    A first sync can spend a minute fetching with nothing to say on stdout
+    until the report; this is the sign of life in between. It is transient by
+    design — each update overwrites the last, and ``finish`` wipes the line —
+    so progress is something watched, never something that lands in a log or
+    above the report in scrollback. That is also why the CLI only builds one
+    when stderr is a terminal.
+
+    stderr rather than stdout, and not because progress is an error: stdout
+    is the *data* channel — ``sync --json | jq`` and ``sync > report`` must
+    receive exactly the report, never a stream of carriage returns — while
+    stderr is POSIX's channel for diagnostic commentary about a run. Progress
+    meters live there by long convention (curl's and git's included), so a
+    redirected stdout still leaves a live ticker on the terminal.
+    """
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+        self._dirty = False
+
+    def __call__(self, text: str) -> None:
+        width = shutil.get_terminal_size().columns
+        line = text if len(text) < width else text[: max(width - 2, 1)] + "…"
+        self._stream.write(f"\r\x1b[K{line}")
+        self._stream.flush()
+        self._dirty = True
+
+    def finish(self) -> None:
+        if self._dirty:
+            self._stream.write("\r\x1b[K")
+            self._stream.flush()
+            self._dirty = False
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
     directory = _archive_dir(args)
     tiers, max_bytes = resolve_media_settings(
         tiers_flag=args.media, max_bytes_flag=args.media_max_bytes, config_path=_config_path(args)
     )
     recheck = parse_duration(args.recheck, flag="--recheck")
+    ticker = Ticker(sys.stderr) if not args.quiet and sys.stderr.isatty() else None
 
     with sync_lock(directory) as acquired:
         if not acquired:
@@ -570,8 +613,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
             media_tiers=tiers,
             media_max_bytes=max_bytes,
             timeout=args.timeout,
+            progress=ticker,
         )
-        report = syncer.run()
+        try:
+            report = syncer.run()
+        finally:
+            # Wipe the ticker even on the error path, or the traceback's first
+            # line would be spliced onto a half-drawn progress line.
+            if ticker is not None:
+                ticker.finish()
     return _emit(render_sync_report(report, as_json=args.json))
 
 

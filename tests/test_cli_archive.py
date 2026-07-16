@@ -640,3 +640,78 @@ def test_a_corrupt_archive_fails_the_search_default_loudly(
     captured = capsys.readouterr()
     assert code == 1
     assert "--live" in captured.err
+
+
+# -- the progress ticker ----------------------------------------------------------
+
+
+class FakeTty:
+    """A terminal-shaped stream: records writes, claims to be a tty."""
+
+    def __init__(self) -> None:
+        self.written: list[str] = []
+
+    def write(self, text: str) -> None:
+        self.written.append(text)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return True
+
+
+def test_the_ticker_rewrites_one_line_and_wipes_itself() -> None:
+    """Progress is watched, not kept: every update overwrites the last, and
+    nothing of the ticker survives into scrollback above the report."""
+    stream = FakeTty()
+    ticker = cli.Ticker(stream)  # type: ignore[arg-type]
+    ticker("syncing #general (1/13)")
+    ticker("syncing #random (2/13)")
+    ticker.finish()
+
+    assert all(chunk.startswith("\r\x1b[K") for chunk in stream.written)
+    assert "syncing #random (2/13)" in stream.written[1]
+    assert stream.written[-1] == "\r\x1b[K"
+    ticker.finish()
+    assert len(stream.written) == 3  # a clean ticker has nothing more to wipe
+
+
+def test_the_ticker_truncates_to_the_terminal_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    monkeypatch.setattr("slack_scrollback.cli.shutil.get_terminal_size", lambda: os.terminal_size((20, 24)))
+    stream = FakeTty()
+    ticker = cli.Ticker(stream)  # type: ignore[arg-type]
+    ticker("a line much longer than twenty columns")
+    payload = stream.written[0].removeprefix("\r\x1b[K")
+    assert len(payload) <= 19
+    assert payload.endswith("…")
+
+
+def test_sync_draws_no_ticker_when_stderr_is_not_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], arch_dir: Path
+) -> None:
+    """A scheduled run's log must hold the report and nothing else — no
+    carriage returns, no escape codes."""
+    fake = base_fake(with_file=False)
+    install_live_client(monkeypatch, fake.handlers())
+
+    code = cli.main(["sync", "--media", "none"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "\r" not in captured.err and "\x1b" not in captured.err
+
+
+def test_sync_quiet_suppresses_the_ticker_even_on_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], arch_dir: Path
+) -> None:
+    fake = base_fake(with_file=False)
+    install_live_client(monkeypatch, fake.handlers())
+    monkeypatch.setattr("slack_scrollback.cli.sys.stderr.isatty", lambda: True, raising=False)
+
+    code = cli.main(["sync", "--media", "none", "--quiet"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "\r" not in captured.err and "\x1b" not in captured.err
+    assert "synced" in captured.out

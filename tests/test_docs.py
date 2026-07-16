@@ -127,6 +127,7 @@ def test_the_skill_documents_every_flag_an_agent_could_want() -> None:
         "--recheck",
         "--media",
         "--media-max-bytes",
+        "--quiet",
     }
     missing = REAL_FLAGS - _documented_flags(SKILL) - operator_only
     assert not missing, f"SKILL.md never mentions: {sorted(missing)}"

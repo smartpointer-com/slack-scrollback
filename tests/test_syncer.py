@@ -866,3 +866,73 @@ def test_the_throttle_note_carries_no_doubled_prefix(tmp_path: Path) -> None:
     rendered = render_sync_report(report)
     assert any(line.startswith("[note: Slack capped") for line in rendered)
     assert not any("note: note:" in line for line in rendered)
+
+
+# -- progress ------------------------------------------------------------------
+
+
+def test_progress_narrates_conversations_threads_and_downloads(tmp_path: Path) -> None:
+    """The callback is the run's only sign of life before the report: it must
+    name what is being fetched, position it in the whole, and count downloads."""
+    parent_ts = ts_at(29 * DAY)
+    reply_ts = ts_at(29 * DAY + 60)
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [
+        thread_parent(parent_ts, reply_count=1, latest_reply=reply_ts),
+        message(ts_at(29 * DAY + 120), "with a file", files=[slack_file()]),
+    ]
+    fake.threads[(CHANNEL, parent_ts)] = [thread_reply(parent_ts, reply_ts)]
+
+    from slack_scrollback.archive import Archive
+    from slack_scrollback.syncer import Syncer
+    from slack_scrollback.workspace import Workspace
+    from tests.conftest import TOKEN, make_client
+
+    ticks: list[str] = []
+    client, _ = make_client(fake.handlers())
+    downloads = FakeFileHost(responses={str(slack_file()["url_private"]): file_body(b"abcdef")})
+    Syncer(
+        Workspace(client),
+        client,
+        Archive.open_rw(tmp_path),
+        token=TOKEN,
+        media_tiers=frozenset({"documents"}),
+        now_fn=lambda: NOW,
+        download_transport=downloads,
+        progress=ticks.append,
+    ).run()
+
+    assert ticks[0] == "listing conversations"
+    assert "#general (1/1)" in ticks
+    assert "#general (1/1) — thread 1/1" in ticks
+    assert "downloading plan.pdf (1/1)" in ticks
+
+
+def test_no_progress_callback_means_no_narration(tmp_path: Path) -> None:
+    """Silence is the default: schedulers and tests get exactly the report."""
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY))]
+    report, _, _ = run_sync(fake, tmp_path)  # run_sync passes no progress; reaching here is the assertion
+    assert report.conversations
+
+
+# -- the Slackbot DM -------------------------------------------------------------
+
+
+def test_the_slackbot_dm_is_rostered_but_never_fetched(tmp_path: Path) -> None:
+    """Slack answers channel_not_found for Slackbot DM history, to every bot,
+    every time. Fetching it would only manufacture the same note forever, so
+    the roster keeps it and the sync passes it by — without a note."""
+    slackbot_dm = {"id": "D0EXAMPLE9", "is_im": True, "user": "USLACKBOT"}
+    fake = FakeSlack(channels=[channel(), slackbot_dm])
+    fake.users["USLACKBOT"] = "Slackbot"
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY))]
+
+    report, archive, transport = run_sync(fake, tmp_path)
+
+    asked = [c.params.get("channel") for c in transport.calls if c.method == "conversations.history"]
+    assert asked == [CHANNEL]
+    listed = rows(archive, "SELECT * FROM conversations WHERE id = ?", "D0EXAMPLE9")
+    assert len(listed) == 1
+    assert report.notes == []
+    assert all(c.name != "@Slackbot" for c in report.conversations)

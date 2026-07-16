@@ -19,12 +19,15 @@ PYTHON_SHEBANG ?= /usr/bin/env python3
 DIST           := slack-scrollback
 
 .DEFAULT_GOAL := all
-.PHONY: all install lint test fmt build clean
+.PHONY: all venv lint test fmt build clean
 
-all: install lint test build
+all: lint test build
 
-## install — create .venv and install the package plus pinned dev tools.
-install: $(VENV)/.stamp
+## venv — create .venv holding the package (editable) and the pinned dev tools.
+#
+# Nothing is installed anywhere else: the tool itself deploys by copying the
+# `build` artifact, so this venv exists purely for the lint/test toolchain.
+venv: $(VENV)/.stamp
 
 # Keyed on pyproject.toml: the venv is rebuilt only when dependencies change.
 $(VENV)/.stamp: pyproject.toml
@@ -34,17 +37,17 @@ $(VENV)/.stamp: pyproject.toml
 	@touch $@
 
 ## lint — static checks: style, import order, formatting, types.
-lint: install
+lint: $(VENV)/.stamp
 	$(VENV)/bin/ruff check src tests
 	$(VENV)/bin/ruff format --check src tests
 	$(VENV)/bin/mypy
 
 ## test — unit tests. No network: the HTTP layer is stubbed throughout.
-test: install
+test: $(VENV)/.stamp
 	$(VENV)/bin/pytest -q
 
 ## fmt — apply formatting and autofixable lint rules.
-fmt: install
+fmt: $(VENV)/.stamp
 	$(VENV)/bin/ruff format src tests
 	$(VENV)/bin/ruff check --fix src tests
 
@@ -53,7 +56,7 @@ fmt: install
 # Having no runtime dependencies is what makes this possible: the whole tool is
 # a stdlib zipapp, so the artifact installs by being copied. No venv, no clone,
 # no package manager, no container — just a file and a python3 to run it.
-build: install
+build: $(VENV)/.stamp
 	@find src -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 	$(PY) -m zipapp src --main "slack_scrollback.cli:main" --python "$(PYTHON_SHEBANG)" --output $(DIST)
 	@chmod +x $(DIST)

@@ -30,6 +30,11 @@ _KIND_ORDER = {KIND_PUBLIC: 0, KIND_PRIVATE: 1, KIND_GROUP_DM: 2, KIND_DM: 3}
 
 _ALL_TYPES = "public_channel,private_channel,mpim,im"
 
+#: Slackbot's user ID, identical in every workspace. Its DM is special-cased
+#: by Slack itself: conversations.history answers channel_not_found to bot
+#: tokens, always — there is no history there for a bot to read.
+SLACKBOT_USER_ID = "USLACKBOT"
+
 # Slack silently caps `limit` to 15 on conversations.history/replies for apps
 # distributed outside the Marketplace. Asking for more and receiving exactly this
 # many, with more still pending, is the signature of that cap.

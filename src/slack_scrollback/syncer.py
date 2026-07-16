@@ -38,7 +38,7 @@ from .archive import Archive
 from .download import download_to, sanitized_filename
 from .errors import DownloadError, ScrollbackError, SlackApiError
 from .format import format_timestamp, message_body, speaker, throttle_notice
-from .workspace import Conversation, Entry, Workspace
+from .workspace import SLACKBOT_USER_ID, Conversation, Entry, Workspace
 
 #: How long an archived user name is trusted before ``users.info`` re-asks.
 USER_REFRESH_SECONDS = 30 * 24 * 3600.0
@@ -79,7 +79,9 @@ class Syncer:
     """One sync run against one archive.
 
     ``now_fn`` and ``download_transport`` are injectable so tests control the
-    clock and the wire. The run stamps a single ``now`` at the start and uses
+    clock and the wire. ``progress``, when given, receives one short line per
+    step — which conversation, which thread, which download — as the run's
+    only sign of life before the report. The run stamps a single ``now`` at the start and uses
     it throughout — as the window's upper bound, and as the moment everything
     first seen or last seen is recorded against.
     """
@@ -98,6 +100,7 @@ class Syncer:
         timeout: float = 30.0,
         now_fn: Callable[[], float] = time.time,
         download_transport: Any = None,
+        progress: Callable[[str], None] | None = None,
     ) -> None:
         self._workspace = workspace
         self._client = client
@@ -110,6 +113,7 @@ class Syncer:
         self._timeout = timeout
         self._now_fn = now_fn
         self._transport = download_transport
+        self._progress = progress
         self._seeded: set[str] = set()
 
     def run(self) -> SyncReport:
@@ -127,6 +131,7 @@ class Syncer:
 
         self._archive.begin()
         try:
+            self._tick("listing conversations")
             self._record_workspace(now)
             conversations = self._workspace.all_conversations()
             for conversation in conversations:
@@ -142,8 +147,17 @@ class Syncer:
                 if vanished:
                     report.notes.append(f"{vanished} conversations are no longer visible and were marked gone")
 
-            for conversation in self._workspace.readable_conversations(include_archived=True):
-                summary = self._sync_conversation(conversation, now, report)
+            # The Slackbot DM stays in the roster but is never fetched:
+            # Slack answers channel_not_found for its history, to every bot,
+            # every time. Asking would only manufacture a recurring note
+            # about a conversation that structurally has nothing to give.
+            readable = [
+                c
+                for c in self._workspace.readable_conversations(include_archived=True)
+                if c.counterpart_id != SLACKBOT_USER_ID
+            ]
+            for index, conversation in enumerate(readable, start=1):
+                summary = self._sync_conversation(conversation, now, report, position=f"{index}/{len(readable)}")
                 report.conversations.append(summary)
 
             self._store_user_names(now)
@@ -184,7 +198,11 @@ class Syncer:
 
     # -- one conversation --------------------------------------------------------
 
-    def _sync_conversation(self, conversation: Conversation, now: float, report: SyncReport) -> ConversationSummary:
+    def _sync_conversation(
+        self, conversation: Conversation, now: float, report: SyncReport, *, position: str
+    ) -> ConversationSummary:
+        label = f"{conversation.name} ({position})"
+        self._tick(label)
         summary = ConversationSummary(name=conversation.name)
         last_ts = self._archive.last_ts(conversation.id)
         oldest_epoch = 0.0 if self._full else min(float(last_ts), now - self._recheck)
@@ -213,6 +231,8 @@ class Syncer:
                     if float(ts) > float(newest_seen or 0):
                         newest_seen = ts
                     self._count(summary, self._store_message(conversation, message, now))
+                    if len(seen_ts) % 200 == 0:
+                        self._tick(f"{label} — {len(seen_ts)} messages")
                     if self._is_thread_parent(message):
                         thread_meta[ts] = (
                             int(message.get("reply_count") or 0),
@@ -242,7 +262,9 @@ class Syncer:
             expected = self._archive.channel_level_ts_between(conversation.id, evidence_floor, now)
             summary.gone += self._archive.mark_messages_gone(conversation.id, expected - seen_ts, now)
 
-        for thread_ts in sorted(self._threads_to_check(conversation, thread_meta, oldest_epoch)):
+        to_check = sorted(self._threads_to_check(conversation, thread_meta, oldest_epoch))
+        for thread_index, thread_ts in enumerate(to_check, start=1):
+            self._tick(f"{label} — thread {thread_index}/{len(to_check)}")
             self._sync_thread(conversation, thread_ts, now, summary, report, evidence_floor=evidence_floor)
 
         if seen_ts:
@@ -250,6 +272,10 @@ class Syncer:
         else:
             self._archive.set_sync_state(conversation.id, last_ts, now, full=self._full)
         return summary
+
+    def _tick(self, text: str) -> None:
+        if self._progress is not None:
+            self._progress(text)
 
     @staticmethod
     def _count(summary: ConversationSummary, status: str) -> None:
@@ -362,9 +388,11 @@ class Syncer:
     # -- media --------------------------------------------------------------------------
 
     def _download_media(self, now: float, report: SyncReport) -> None:
-        for row in self._archive.download_queue(tiers=self._tiers, max_bytes=self._max_bytes):
+        queue = self._archive.download_queue(tiers=self._tiers, max_bytes=self._max_bytes)
+        for count, row in enumerate(queue, start=1):
             file_id = str(row["id"])
             name = sanitized_filename(row["name"], fallback=file_id)
+            self._tick(f"downloading {name} ({count}/{len(queue)})")
             dest = self._archive.media_dir / file_id / name
             label = f"{name} ({file_id})"
             try:
