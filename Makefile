@@ -58,7 +58,7 @@ fmt: $(VENV)/.stamp
 # no package manager, no container — just a file and a python3 to run it.
 build: $(VENV)/.stamp
 	@find src -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-	$(PY) -m zipapp src --main "slack_scrollback.cli:main" --python "$(PYTHON_SHEBANG)" --output $(DIST)
+	$(PY) -m zipapp src --main "slack_scrollback.cli:run" --python "$(PYTHON_SHEBANG)" --output $(DIST)
 	@chmod +x $(DIST)
 	@echo "built ./$(DIST) ($$(du -h $(DIST) | cut -f1)) — copy this one file anywhere with python3.11+"
 

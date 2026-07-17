@@ -759,5 +759,17 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Process entry point: exit with ``main``'s verdict.
+
+    ``main`` returns its exit code so tests can call it as a function. The
+    two launchers differ in what they do with that: pip's console script
+    wraps it in ``sys.exit`` itself, but the zipapp's generated ``__main__``
+    discards return values — built artifacts must enter here, or every
+    handled error exits 0 and a scheduler reads failure as success.
+    """
     sys.exit(main())
+
+
+if __name__ == "__main__":
+    run()

@@ -662,3 +662,40 @@ def test_a_file_shared_into_two_channels_gets_two_distinct_rows(archive: Archive
         f"{CHANNEL}:100.000100:{FILE_ID}",
         f"{OTHER_CHANNEL}:200.000100:{FILE_ID}",
     }
+
+
+# -- a read-only consumer discovers sync is not their command --------------------
+
+
+def _read_only(path: Path) -> None:
+    path.chmod(0o500)
+
+
+def test_sync_lock_in_an_unwritable_directory_explains_instead_of_tracing(tmp_path: Path) -> None:
+    """The lock file is a sync run's first write, so it is where a read-only
+    consumer of a shared archive lands — they deserve the tool's own words,
+    naming who syncs and what they themselves should run."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    _read_only(shared)
+    try:
+        with pytest.raises(ScrollbackError) as caught, sync_lock(shared):
+            pass
+    finally:
+        shared.chmod(0o700)
+    message = str(caught.value)
+    assert "cannot write to the archive directory" in message
+    assert "owner runs sync" in message
+    assert "--archive" in message or "search" in message
+
+
+def test_open_rw_in_an_uncreatable_directory_explains_instead_of_tracing(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    _read_only(parent)
+    try:
+        with pytest.raises(ScrollbackError) as caught:
+            Archive.open_rw(parent / "archive")
+    finally:
+        parent.chmod(0o700)
+    assert "cannot write to the archive directory" in str(caught.value)

@@ -715,3 +715,33 @@ def test_sync_quiet_suppresses_the_ticker_even_on_a_terminal(
     assert code == 0
     assert "\r" not in captured.err and "\x1b" not in captured.err
     assert "synced" in captured.out
+
+
+def test_sync_against_a_read_only_shared_archive_errors_cleanly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], arch_dir: Path
+) -> None:
+    """The shared-archive arrangement is owner-writes, everyone-else-reads; a
+    reader who runs sync anyway gets one prescriptive line, not a traceback."""
+    fake = base_fake(with_file=False)
+    sync_archive(fake, arch_dir)
+    arch_dir.chmod(0o500)
+    forbid_client(monkeypatch)
+    try:
+        code = cli.main(["sync"])
+    finally:
+        arch_dir.chmod(0o700)
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err.startswith("error: cannot write to the archive directory")
+    assert "owner runs sync" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_run_exits_with_mains_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The zipapp enters through run(): if it merely returned main()'s code,
+    the built artifact would exit 0 on every handled error and a scheduler
+    would read failure as success."""
+    monkeypatch.setattr("sys.argv", ["slack-scrollback", "history", "general", "--archive"])
+    with pytest.raises(SystemExit) as caught:
+        cli.run()
+    assert caught.value.code == 1

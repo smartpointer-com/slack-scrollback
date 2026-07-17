@@ -257,8 +257,18 @@ def sync_lock(directory: Path) -> Iterator[bool]:
     except ImportError:  # pragma: no cover - non-POSIX platforms only
         yield True
         return
-    directory.mkdir(parents=True, exist_ok=True)
-    with open(directory / LOCK_NAME, "w") as handle:
+    # The lock file is the first write of a sync run, so it is also where a
+    # read-only consumer of a shared archive finds out sync is not their
+    # command — that deserves the tool's own words, not a traceback.
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        # Opened outside its `with` so this except guards exactly the open:
+        # wrapped around the whole block it would also swallow OSErrors from
+        # the caller's body re-raised through the yield, and mislabel them.
+        handle = open(directory / LOCK_NAME, "w")  # noqa: SIM115
+    except OSError as exc:
+        raise ScrollbackError(_unwritable(directory, exc)) from exc
+    with handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -274,6 +284,14 @@ def _unopenable(directory: Path, exc: Exception) -> str:
     return (
         f"the archive at {directory} cannot be opened ({exc}) — if the file is corrupt or half-copied, "
         f"move {DB_NAME} aside and re-run 'slack-scrollback sync'; pass --live to read Slack without it"
+    )
+
+
+def _unwritable(directory: Path, exc: OSError) -> str:
+    return (
+        f"cannot write to the archive directory {directory} ({exc.strerror}) — sync is the archive's writer "
+        f"and needs write access there. A shared archive is usually shared read-only: its owner runs sync, "
+        f"and everyone else reads it through search, 'history --archive', and 'file'"
     )
 
 
@@ -309,8 +327,11 @@ class Archive:
 
     @classmethod
     def open_rw(cls, directory: Path) -> Archive:
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / MEDIA_DIR_NAME).mkdir(exist_ok=True)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / MEDIA_DIR_NAME).mkdir(exist_ok=True)
+        except OSError as exc:
+            raise ScrollbackError(_unwritable(directory, exc)) from exc
         # isolation_level=None puts sqlite3 in autocommit so that BEGIN/COMMIT
         # are explicit — the one-transaction-per-run contract is then visible
         # in the code that honours it rather than implied by driver defaults.
