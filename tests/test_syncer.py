@@ -23,6 +23,7 @@ from tests.conftest import (
     NOW,
     FakeFileHost,
     FakeSlack,
+    capped_handlers,
     channel,
     file_body,
     message,
@@ -570,16 +571,11 @@ def test_a_run_that_dies_midway_leaves_the_previous_runs_state(tmp_path: Path) -
 # -- throttling ----------------------------------------------------------------------
 
 
-class _CappedWorkspace(FakeSlack):
-    """History answers exactly 15 messages with more pending — the silent-cap signature."""
-
-    def _history(self, params: dict[str, str]) -> dict[str, Any]:
-        return ok(messages=[message(ts_at(29 * DAY + i)) for i in range(15)], has_more=True)
-
-
 def test_a_silently_capped_page_is_reported_as_throttling(tmp_path: Path) -> None:
     """Sync asks for 1000; fifteen-with-more can only be Slack's cap, and the report must say so."""
-    report, _, _ = run_sync(_CappedWorkspace(), tmp_path)
+    fake = FakeSlack()
+    fake.messages[CHANNEL] = [message(ts_at(29 * DAY + i)) for i in range(16)]
+    report, _, _ = run_sync(fake, tmp_path, handlers=capped_handlers(fake))
 
     assert report.throttled is True
     assert any("capped" in note for note in report.notes)
@@ -767,8 +763,6 @@ def test_unmoved_thread_counters_trigger_no_replies_fetch(tmp_path: Path) -> Non
     fake.threads[(CHANNEL, parent_ts)] = [thread_reply(parent_ts, reply_ts)]
     run_sync(fake, tmp_path)
 
-    _, _, transport = run_sync(fake, tmp_path)
-    replies_calls = [c for c in transport.calls if c.method == "conversations.replies"]
     # The stored-activity recheck legitimately re-asks threads alive inside
     # the window; what must NOT happen is a fetch driven by unmoved counters
     # once the thread has left the window.
@@ -791,7 +785,7 @@ def test_sync_without_fts5_warns_and_still_archives(tmp_path: Path, monkeypatch:
     fake.messages[CHANNEL] = [message(ts_at(29 * DAY), "kept without an index")]
     report, archive, _ = run_sync(fake, tmp_path)
 
-    assert "this SQLite lacks FTS5; archive search will fall back to a full scan" in report.notes
+    assert "this Python's SQLite lacks FTS5; archive search will fall back to a full scan" in report.notes
     assert stored_message(archive, str(fake.messages[CHANNEL][0]["ts"])) is not None
 
 
@@ -847,25 +841,7 @@ def test_the_throttle_note_carries_no_doubled_prefix(tmp_path: Path) -> None:
     proofread the output."""
     fake = FakeSlack()
     fake.messages[CHANNEL] = [message(ts_at(29 * DAY + i), f"m{i}") for i in range(15)]
-    original = fake._history
-
-    def capped(params: dict[str, str]) -> dict[str, Any]:
-        body = original(params)
-        body["messages"] = body["messages"][:15]
-        body["has_more"] = True
-        return body
-
-    fake_handlers = fake.handlers()
-    fake_handlers["conversations.history"] = capped
-    from slack_scrollback.archive import Archive
-    from slack_scrollback.syncer import Syncer
-    from slack_scrollback.workspace import Workspace
-    from tests.conftest import TOKEN, make_client
-
-    client, _ = make_client(fake_handlers)
-    workspace = Workspace(client)
-    archive = Archive.open_rw(tmp_path)
-    report = Syncer(workspace, client, archive, token=TOKEN, now_fn=lambda: NOW).run()
+    report, _, _ = run_sync(fake, tmp_path, handlers=capped_handlers(fake))
 
     assert report.throttled
     (throttle_note,) = [n for n in report.notes if "capped" in n]
@@ -890,24 +866,9 @@ def test_progress_narrates_conversations_threads_and_downloads(tmp_path: Path) -
     ]
     fake.threads[(CHANNEL, parent_ts)] = [thread_reply(parent_ts, reply_ts)]
 
-    from slack_scrollback.archive import Archive
-    from slack_scrollback.syncer import Syncer
-    from slack_scrollback.workspace import Workspace
-    from tests.conftest import TOKEN, make_client
-
     ticks: list[str] = []
-    client, _ = make_client(fake.handlers())
     downloads = FakeFileHost(responses={str(slack_file()["url_private"]): file_body(b"abcdef")})
-    Syncer(
-        Workspace(client),
-        client,
-        Archive.open_rw(tmp_path),
-        token=TOKEN,
-        media_tiers=frozenset({"documents"}),
-        now_fn=lambda: NOW,
-        download_transport=downloads,
-        progress=ticks.append,
-    ).run()
+    run_sync(fake, tmp_path, media_tiers=frozenset({"documents"}), downloads=downloads, progress=ticks.append)
 
     assert ticks[0] == "listing conversations"
     assert "#general (1/1)" in ticks
@@ -969,7 +930,7 @@ def old_days(*days: int) -> list[dict[str, Any]]:
 def test_sweep_slices_tile_history_without_gap_overlap_or_false_gone(tmp_path: Path) -> None:
     """One lap in three slices: each starts exactly where the last ended
     (exclusive bound), every old message is re-verified exactly once, and —
-    the §8 boundary case — the previous slice's oldest message is never
+    the boundary case — the previous slice's oldest message is never
     falsely gone-marked by the next slice's deletion diff."""
     fake = FakeSlack()
     fake.messages[CHANNEL] = [*old_days(1, 2, 3, 4, 5, 6, 7), message(ts_at(29 * DAY), "recent")]
@@ -1101,32 +1062,15 @@ def test_a_throttled_run_pauses_the_sweep_and_notes_it_once(tmp_path: Path) -> N
     fake = FakeSlack(channels=[channel(), channel(OTHER_CHANNEL, "random")])
     fake.messages[CHANNEL] = [message(ts_at(29 * DAY + i), f"m{i}") for i in range(15)]
     fake.messages[OTHER_CHANNEL] = [message(ts_at(28 * DAY + i), f"r{i}") for i in range(15)]
-    original = fake._history
-
-    def capped(params: dict[str, str]) -> dict[str, Any]:
-        body = original(params)
-        body["messages"] = body["messages"][:15]
-        body["has_more"] = True
-        return body
-
-    handlers = fake.handlers()
-    handlers["conversations.history"] = capped
-    from slack_scrollback.archive import Archive
-    from slack_scrollback.syncer import Syncer
-    from slack_scrollback.workspace import Workspace
-    from tests.conftest import TOKEN, make_client
-
-    client, transport = make_client(handlers)
-    archive = Archive.open_rw(tmp_path)
-    report = Syncer(Workspace(client), client, archive, token=TOKEN, sweep_pages=1, now_fn=lambda: NOW).run()
+    report, archive, transport = run_sync(fake, tmp_path, sweep_pages=1, handlers=capped_handlers(fake))
 
     assert report.throttled
     assert sweep_slice_calls(transport) == []
     assert len([n for n in report.notes if "repair sweep was skipped" in n]) == 1
     assert report.sweep_lap_completed is False
-    # "The critical window work must stay cheap" — cheap, not skipped: both
-    # conversations' window messages are archived despite the pause, including
-    # the one whose sync began after throttling was first detected.
+    # Cheap, not skipped: both conversations' window messages are archived
+    # despite the pause, including the one whose sync began after throttling
+    # was first detected.
     stored = {str(r["text"]) for r in rows(archive, "SELECT text FROM messages")}
     assert {"m0", "m14", "r0", "r14"} <= stored
 
@@ -1311,9 +1255,9 @@ def test_an_incomplete_roster_listing_suspends_gone_marking(tmp_path: Path, monk
 
 
 def test_sweep_telemetry_counts_slices_and_the_oldest_verified_ts(tmp_path: Path) -> None:
-    """The report is how an operator sizes a lap: pages actually fetched, how
-    deep this run verified, and whether the lap closed — in the dataclass and
-    in the JSON summary alike."""
+    """The report is what sizes a lap: pages actually fetched, how deep this
+    run verified, and whether the lap closed — in the dataclass and in the
+    JSON summary alike."""
     fake = FakeSlack()
     fake.messages[CHANNEL] = [*old_days(1, 2, 3, 4, 5, 6, 7), message(ts_at(29 * DAY), "recent")]
 
@@ -1376,14 +1320,7 @@ def test_a_roster_hitting_the_pagination_cap_disables_gone_marking_for_real(
 
     handlers = fake.handlers()
     handlers["conversations.list"] = paginated_list
-    from slack_scrollback.archive import Archive
-    from slack_scrollback.syncer import Syncer
-    from slack_scrollback.workspace import Workspace
-    from tests.conftest import TOKEN, make_client
-
-    client, _ = make_client(handlers)
-    archive = Archive.open_rw(tmp_path)
-    report = Syncer(Workspace(client), client, archive, token=TOKEN, sweep_pages=0, now_fn=lambda: NOW + 60).run()
+    report, archive, _ = run_sync(fake, tmp_path, now=NOW + 60, handlers=handlers)
 
     unlisted = rows(archive, "SELECT * FROM conversations WHERE id = ?", OTHER_CHANNEL)[0]
     assert unlisted["gone_at"] is None

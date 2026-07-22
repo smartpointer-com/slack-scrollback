@@ -29,15 +29,14 @@ from __future__ import annotations
 import contextlib
 import os
 import tempfile
-import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .api import _USER_AGENT, HttpResponse, Transport
-from .errors import DownloadError, ScrollbackError
+from .api import _USER_AGENT, HttpResponse, Transport, _opener_get
+from .errors import DownloadError
 
 FILES_HOST = "files.slack.com"
 SAFE_HOST = "slack-files.com"
@@ -71,27 +70,7 @@ _OPENER = urllib.request.build_opener(_CaptureRedirects)
 
 def download_transport(url: str, headers: Mapping[str, str], timeout: float) -> HttpResponse:
     """One GET that returns redirects and HTTP errors as values."""
-    request = urllib.request.Request(url, headers=dict(headers), method="GET")
-    try:
-        with _OPENER.open(request, timeout=timeout) as response:
-            return HttpResponse(
-                status=response.status,
-                headers={k.lower(): v for k, v in response.headers.items()},
-                body=response.read(),
-            )
-    except urllib.error.HTTPError as exc:
-        return HttpResponse(
-            status=exc.code,
-            headers={k.lower(): v for k, v in (exc.headers or {}).items()},
-            body=exc.read(),
-        )
-    except urllib.error.URLError as exc:
-        raise ScrollbackError(
-            f"cannot reach {urllib.parse.urlsplit(url).hostname}: {exc.reason} — "
-            f"check network connectivity and any proxy settings"
-        ) from exc
-    except TimeoutError as exc:
-        raise ScrollbackError(f"timed out downloading after {timeout:g}s — retry, or raise --timeout") from exc
+    return _opener_get(_OPENER, url, headers, timeout)
 
 
 def _require_files_host(url: str, label: str) -> None:

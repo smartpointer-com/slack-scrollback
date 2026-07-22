@@ -26,6 +26,7 @@ from .workspace import (
     Conversation,
     Entry,
     FetchResult,
+    compose_permalink,
     is_readable,
     no_such_speaker_note,
     resolve_conversation,
@@ -105,12 +106,7 @@ class ArchiveReader:
         team_url = self._archive.get_meta("team_url")
         if not team_url:
             return None
-        ts = str(message.get("ts") or "")
-        url = f"{team_url}/archives/{conversation.id}/p{ts.replace('.', '')}"
-        thread_ts = message.get("thread_ts")
-        if thread_ts:
-            url = f"{url}?thread_ts={thread_ts}&cid={conversation.id}"
-        return url
+        return compose_permalink(team_url, conversation.id, message)
 
     # -- messages ---------------------------------------------------------------------
 

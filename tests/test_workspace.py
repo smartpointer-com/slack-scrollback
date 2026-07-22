@@ -476,7 +476,8 @@ def test_search_ignores_join_noise() -> None:
 
 
 def test_search_survives_a_conversation_that_refuses_history() -> None:
-    """The Slackbot DM is listed but returns channel_not_found."""
+    """A refusal — as the Slackbot DM answers every bot, live — must cost a
+    workspace-wide search one conversation, not the whole answer."""
 
     def handler(params: dict[str, str]) -> dict[str, Any]:
         if params.get("channel") == "C0EXAMPLE1":

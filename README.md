@@ -1,7 +1,7 @@
 # slack-scrollback
 
-Read-only Slack history and search for LLM agents, over a bot token, as
-deterministic CLI calls.
+Slack history and search for humans and AI agents, from the command-line, using
+only a bot token.
 
 An agent with shell access can already talk to Slack; what it usually cannot do
 is *read what was said*. `slack-scrollback` fills that gap and nothing else: six
@@ -429,6 +429,15 @@ consume without knowing this tool's schema:
 | `text` | rendered message text; empty on file rows |
 | `media_type` | `document`, `image`, or `other` — file rows only |
 | `filename`, `mime_type`, `local_path` | file rows only, `local_path` set iff bytes are on disk |
+
+The column vocabulary is deliberately [wacli](https://github.com/steipete/wacli)'s:
+every column above exists under the same name in wacli's WhatsApp message
+store, so tooling built to index a wacli database — the corpus indexer
+[fundus](https://github.com/smartpointer-com/fundus), for one — can point the
+same reader at a Slack archive. The remaining differences are small: `ts` here
+is fractional where wacli stores whole seconds, `chat_jid` holds a Slack
+conversation ID rather than a WhatsApp JID (an opaque key either way), and
+`media_type` collapses audio and video into `other`.
 
 Semantics an indexer may rely on: rows are append-mostly; an edit changes
 `text` in place; a soft-deleted message or file vanishes from the view (so a

@@ -40,7 +40,10 @@ def _commands(text: str) -> list[str]:
     for fragment in _code_fragments(text):
         if not fragment.startswith(_PREFIX):
             continue
-        # shlex handles the trailing "# comment" without eating '#general'.
+        # comments=True strips a trailing "# comment". A quoted '#general'
+        # survives; a bare one would be eaten here exactly as a shell would
+        # eat it — and the resulting truncated command fails the parse test,
+        # so a doc line that forgets the quotes cannot slip through silently.
         try:
             argv = shlex.split(fragment, comments=True)
         except ValueError:
@@ -84,8 +87,9 @@ def test_every_command_in_the_readme_parses(command: str) -> None:
 
 
 def test_the_skill_has_a_recipe_for_every_agent_facing_subcommand() -> None:
-    """`sync` is deliberately absent: it is the operator's scheduled job, and a
-    recipe for it would invite an agent to rebuild the archive mid-question."""
+    """`sync` is deliberately absent: it belongs to a schedule, not to a
+    question, and a recipe for it would invite an agent to rebuild the
+    archive mid-answer."""
     documented = {command.split()[0] for command in _commands(SKILL)}
     assert {"channels", "history", "thread", "search", "file"} <= documented
 
@@ -112,11 +116,11 @@ def test_no_document_offers_a_flag_that_does_not_exist(doc: str, name: str) -> N
 def test_the_skill_documents_every_flag_an_agent_could_want() -> None:
     """A flag the model never hears about may as well not exist.
 
-    Operator-only flags are the exception: credentials, plumbing paths, and the
-    whole of `sync` (a scheduled job, not an answer to a question) would only
-    dilute the flag table's "this is everything" promise.
+    Setup and maintenance flags are the exception: credentials, plumbing
+    paths, and the whole of `sync` (a scheduled job, not an answer to a
+    question) would only dilute the flag table's "this is everything" promise.
     """
-    operator_only = {
+    not_agent_facing = {
         "--token",
         "--config",
         "--timeout",
@@ -130,7 +134,7 @@ def test_the_skill_documents_every_flag_an_agent_could_want() -> None:
         "--quiet",
         "--sweep",
     }
-    missing = REAL_FLAGS - _documented_flags(SKILL) - operator_only
+    missing = REAL_FLAGS - _documented_flags(SKILL) - not_agent_facing
     assert not missing, f"SKILL.md never mentions: {sorted(missing)}"
 
 
@@ -151,6 +155,6 @@ def test_the_readme_lists_exactly_the_allowlisted_methods() -> None:
 
 def test_the_readme_never_presents_an_absent_method_as_available() -> None:
     claimed = set(re.findall(r"`(users\.\w+|conversations\.\w+|chat\.\w+|auth\.\w+)`", README))
-    # Named only to explain why they are absent, or as an operator's own step.
+    # Named only to explain why they are absent, or in the join-all setup script.
     explained = {"chat.getPermalink", "users.list", "conversations.join"}
     assert claimed - explained <= READ_ONLY_METHODS

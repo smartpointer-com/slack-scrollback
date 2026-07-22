@@ -56,8 +56,9 @@ def test_too_many_arguments_show_both_accepted_forms() -> None:
 
 def test_every_subcommand_is_reachable() -> None:
     parser = cli.build_parser()
-    for command in ("channels", "history", "thread", "search"):
-        args = parser.parse_args([command, *(["x"] if command in ("history", "thread", "search") else [])])
+    positional = {"history": ["x"], "thread": ["x"], "search": ["x"], "file": ["F0EXAMPLE1"]}
+    for command in ("channels", "history", "thread", "search", "sync", "file"):
+        args = parser.parse_args([command, *positional.get(command, [])])
         assert args.command == command
 
 
@@ -65,7 +66,10 @@ def test_every_subcommand_works_with_no_optional_flags() -> None:
     parser = cli.build_parser()
     assert parser.parse_args(["channels"]).json is False
     assert parser.parse_args(["history", "#general"]).limit == cli.DEFAULT_LIMIT
+    assert parser.parse_args(["thread", PERMALINK]).limit == cli.DEFAULT_LIMIT
     assert parser.parse_args(["search", "budget"]).since == cli.DEFAULT_SEARCH_WINDOW
+    assert parser.parse_args(["sync"]).full is False
+    assert parser.parse_args(["file", "F0EXAMPLE1"]).live is False
 
 
 def test_search_scoping_flags_are_named_naturally() -> None:
@@ -97,12 +101,12 @@ CONVERSATIONS = ok(channels=[channel("C0EXAMPLE1", "general")])
 USER = ok(user={"id": "U0EXAMPLE1", "profile": {"display_name": "alice"}})
 
 
-def run(monkeypatch: pytest.MonkeyPatch, argv: list[str], handlers: dict[str, Any]) -> tuple[int, str, str]:
+def run(monkeypatch: pytest.MonkeyPatch, argv: list[str], handlers: dict[str, Any]) -> tuple[int, FakeTransport]:
     transport = FakeTransport(handlers=handlers)
     monkeypatch.setattr("slack_scrollback.cli.SlackClient", lambda token, **kw: _client(token, transport))
     monkeypatch.setenv("SLACK_BOT_TOKEN", TOKEN)
     code = cli.main(argv)
-    return code, "", ""
+    return code, transport
 
 
 def _client(token: str, transport: FakeTransport) -> Any:
@@ -117,7 +121,7 @@ def test_history_prints_messages(monkeypatch: pytest.MonkeyPatch, capsys: pytest
         "conversations.history": ok(messages=[message("1700000000.000100", "hello there")]),
         "users.info": USER,
     }
-    code, _, _ = run(monkeypatch, ["history", "#general"], handlers)
+    code, _ = run(monkeypatch, ["history", "#general"], handlers)
     out = capsys.readouterr().out
     assert code == 0
     assert "alice: hello there" in out
@@ -126,7 +130,7 @@ def test_history_prints_messages(monkeypatch: pytest.MonkeyPatch, capsys: pytest
 def test_an_unknown_channel_exits_non_zero_with_one_actionable_line(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code, _, _ = run(monkeypatch, ["history", "#nope"], {"conversations.list": CONVERSATIONS, "users.info": USER})
+    code, _ = run(monkeypatch, ["history", "#nope"], {"conversations.list": CONVERSATIONS, "users.info": USER})
     captured = capsys.readouterr()
     assert code == 1
     assert captured.out == ""
@@ -142,7 +146,7 @@ def test_a_slack_error_is_reported_actionably(
         "conversations.history": err("missing_scope", needed="channels:history"),
         "users.info": USER,
     }
-    code, _, _ = run(monkeypatch, ["history", "#general"], handlers)
+    code, _ = run(monkeypatch, ["history", "#general"], handlers)
     assert code == 1
     assert "channels:history" in capsys.readouterr().err
 
@@ -150,6 +154,10 @@ def test_a_slack_error_is_reported_actionably(
 def test_a_bad_token_never_reaches_the_network(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    def no_client(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a client was constructed for a token that should have been rejected first")
+
+    monkeypatch.setattr("slack_scrollback.cli.SlackClient", no_client)
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxp-user-token")
     code = cli.main(["channels"])
     assert code == 1
@@ -158,7 +166,7 @@ def test_a_bad_token_never_reaches_the_network(
 
 def test_the_token_never_appears_in_output(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     handlers = {"conversations.list": err("invalid_auth")}
-    code, _, _ = run(monkeypatch, ["channels"], handlers)
+    code, _ = run(monkeypatch, ["channels"], handlers)
     captured = capsys.readouterr()
     assert code == 1
     assert TOKEN not in captured.out
@@ -172,7 +180,7 @@ def test_channels_lists_readable_conversations(
         "conversations.list": CONVERSATIONS,
         "conversations.history": ok(messages=[message("1700000000.000100")]),
     }
-    code, _, _ = run(monkeypatch, ["channels", "--no-activity"], handlers)
+    code, _ = run(monkeypatch, ["channels", "--no-activity"], handlers)
     out = capsys.readouterr().out
     assert code == 0
     assert "#general" in out
@@ -210,18 +218,22 @@ def test_links_flag_appends_permalinks_and_its_absence_does_not(
 def test_no_threads_flag_suppresses_the_replies_request(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    parent = message("1700000000.000100", "q", thread_ts="1700000000.000100", reply_count=1)
-    reply = message("1700000001.000100", "a", thread_ts="1700000000.000100")
+    parent = message("1700000000.000100", "the question", thread_ts="1700000000.000100", reply_count=1)
+    reply = message("1700000001.000100", "the reply", thread_ts="1700000000.000100")
     handlers = {
         "conversations.list": CONVERSATIONS,
         "conversations.history": ok(messages=[parent]),
         "conversations.replies": ok(messages=[parent, reply]),
         "users.info": USER,
     }
-    run(monkeypatch, ["history", "#general"], handlers)
-    assert "a" in capsys.readouterr().out
-    run(monkeypatch, ["history", "#general", "--no-threads"], handlers)
-    assert "q" in capsys.readouterr().out
+    _, transport = run(monkeypatch, ["history", "#general"], handlers)
+    assert "conversations.replies" in transport.methods
+    assert "the reply" in capsys.readouterr().out
+    _, transport = run(monkeypatch, ["history", "#general", "--no-threads"], handlers)
+    assert "conversations.replies" not in transport.methods
+    out = capsys.readouterr().out
+    assert "the question" in out
+    assert "the reply" not in out
 
 
 def test_in_flag_restricts_the_search_to_one_conversation(
@@ -250,16 +262,18 @@ def test_no_activity_flag_skips_the_per_conversation_lookup(
         "conversations.list": CONVERSATIONS,
         "conversations.history": ok(messages=[message("1700000000.000100")]),
     }
-    run(monkeypatch, ["channels"], handlers)
+    _, transport = run(monkeypatch, ["channels"], handlers)
+    assert "conversations.history" in transport.methods
     assert "2023" in capsys.readouterr().out  # the message's real date is rendered
-    run(monkeypatch, ["channels", "--no-activity"], handlers)
+    _, transport = run(monkeypatch, ["channels", "--no-activity"], handlers)
+    assert "conversations.history" not in transport.methods
     assert "-" in capsys.readouterr().out
 
 
 def test_channels_lists_the_most_recently_active_first(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    three = ok(
+    listing = ok(
         channels=[
             channel("C0EXAMPLE1", "stale"),
             channel("C0EXAMPLE2", "busy"),
@@ -267,7 +281,7 @@ def test_channels_lists_the_most_recently_active_first(
     )
     last = {"C0EXAMPLE1": "1600000000.000100", "C0EXAMPLE2": "1700000000.000100"}
     handlers = {
-        "conversations.list": three,
+        "conversations.list": listing,
         "conversations.history": lambda p: ok(messages=[message(last[p["channel"]])]),
     }
     run(monkeypatch, ["channels"], handlers)
@@ -298,6 +312,6 @@ def test_search_reports_no_matches_rather_than_nothing(
         "conversations.list": CONVERSATIONS,
         "conversations.history": ok(messages=[message("1700000000.000100", "hi")]),
     }
-    code, _, _ = run(monkeypatch, ["search", "nothing-matches-this"], handlers)
+    code, _ = run(monkeypatch, ["search", "nothing-matches-this"], handlers)
     assert code == 0
     assert "(no messages found)" in capsys.readouterr().out

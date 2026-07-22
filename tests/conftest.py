@@ -160,15 +160,6 @@ def local_zone(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], None
     time.tzset()
 
 
-@pytest.fixture
-def workspace_factory() -> Callable[[dict[str, Handler]], tuple[Workspace, FakeTransport]]:
-    def build(handlers: dict[str, Handler]) -> tuple[Workspace, FakeTransport]:
-        client, transport = make_client(handlers)
-        return Workspace(client), transport
-
-    return build
-
-
 # -- sync fixtures -----------------------------------------------------------
 #
 # Sync tests drive a mutable in-memory "workspace": set up channels, messages
@@ -280,6 +271,25 @@ class FakeSlack:
         return ok(user={"id": user_id, "profile": {"display_name": self.users[user_id]}})
 
 
+def capped_handlers(fake: FakeSlack, cap: int = 15) -> dict[str, Handler]:
+    """``fake.handlers()`` with history capped to ``cap`` messages, more pending.
+
+    Fifteen-with-more against a request for far more is the signature of
+    Slack's silent throttle on apps distributed outside the Marketplace.
+    """
+    original = fake._history
+
+    def capped(params: dict[str, str]) -> dict[str, Any]:
+        body = original(params)
+        body["messages"] = body["messages"][:cap]
+        body["has_more"] = True
+        return body
+
+    handlers = fake.handlers()
+    handlers["conversations.history"] = capped
+    return handlers
+
+
 @dataclass
 class FakeFileHost:
     """Answers media downloads from a canned URL table, recording each request."""
@@ -315,6 +325,8 @@ def run_sync(
     downloads: FakeFileHost | None = None,
     sweep_pages: int = 0,
     sweep_page_size: int = 200,
+    handlers: dict[str, Handler] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[Any, Any, FakeTransport]:
     """One sync run; returns ``(report, archive, transport)``.
 
@@ -323,13 +335,14 @@ def run_sync(
     The repair sweep is OFF by default here, unlike production: most tests
     assert exact windows and call counts, and a sweep slice underneath them
     would couple every assertion to the sweep schedule. Sweep tests opt in.
+    ``handlers`` overrides ``fake.handlers()`` for tests that wrap a method.
     """
     from pathlib import Path
 
     from slack_scrollback.archive import Archive
     from slack_scrollback.syncer import Syncer
 
-    client, transport = make_client(fake.handlers())
+    client, transport = make_client(handlers if handlers is not None else fake.handlers())
     workspace = Workspace(client)
     archive = Archive.open_rw(Path(archive_dir))
     syncer = Syncer(
@@ -345,6 +358,7 @@ def run_sync(
         sweep_page_size=sweep_page_size,
         now_fn=lambda: now,
         download_transport=downloads,
+        progress=progress,
     )
     report = syncer.run()
     return report, archive, transport

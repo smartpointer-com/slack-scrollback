@@ -95,9 +95,9 @@ class Syncer:
     ``now_fn`` and ``download_transport`` are injectable so tests control the
     clock and the wire. ``progress``, when given, receives one short line per
     step — which conversation, which thread, which download — as the run's
-    only sign of life before the report. The run stamps a single ``now`` at the start and uses
-    it throughout — as the window's upper bound, and as the moment everything
-    first seen or last seen is recorded against.
+    only sign of life before the report. The run stamps a single ``now`` at
+    the start and uses it throughout — as the window's upper bound, and as
+    the moment everything first seen or last seen is recorded against.
     """
 
     def __init__(
@@ -200,7 +200,7 @@ class Syncer:
         if self._sweep_pages == 0 and not self._full:
             report.sweep_lap_completed = False
         if self._archive.fts_unavailable_reason:
-            report.notes.append("this SQLite lacks FTS5; archive search will fall back to a full scan")
+            report.notes.append("this Python's SQLite lacks FTS5; archive search will fall back to a full scan")
         report.duration_seconds = time.monotonic() - started
         return report
 

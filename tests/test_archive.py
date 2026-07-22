@@ -674,8 +674,8 @@ def _read_only(path: Path) -> None:
 
 def test_sync_lock_in_an_unwritable_directory_explains_instead_of_tracing(tmp_path: Path) -> None:
     """The lock file is a sync run's first write, so it is where a read-only
-    consumer of a shared archive lands — they deserve the tool's own words,
-    naming who syncs and what they themselves should run."""
+    consumer of a shared archive lands — the error must speak the tool's own
+    words: which side runs sync, and which commands read instead."""
     shared = tmp_path / "shared"
     shared.mkdir()
     _read_only(shared)
@@ -708,8 +708,6 @@ def test_open_rw_in_an_uncreatable_directory_explains_instead_of_tracing(tmp_pat
 def test_a_v1_archive_upgrades_in_place_with_data_intact(tmp_path: Path) -> None:
     """The field has v1 archives; opening one must add the sweep columns and
     bump both version stamps without touching a single stored row."""
-    import sqlite3
-
     from slack_scrollback.archive import MIGRATIONS
 
     con = sqlite3.connect(tmp_path / "archive.db", isolation_level=None)

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import pathlib
 import urllib.request
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 
@@ -24,7 +24,7 @@ from slack_scrollback.api import (
     urllib_transport,
 )
 from slack_scrollback.errors import ReadOnlyViolation, ScrollbackError, SlackApiError
-from tests.conftest import TOKEN, ExplodingTransport, RecordingSleep, err, make_client, ok
+from tests.conftest import TOKEN, ExplodingTransport, FakeTransport, RecordingSleep, err, make_client, ok
 
 # Methods that change a workspace. None may ever be callable.
 WRITE_METHODS = [
@@ -298,7 +298,7 @@ def test_missing_scope_names_the_needed_scope() -> None:
     assert "reinstall" in message
 
 
-def test_not_in_channel_tells_you_to_invite_the_bot() -> None:
+def test_not_in_channel_says_to_invite_the_bot() -> None:
     client, _ = make_client({"conversations.history": err("not_in_channel")})
     with pytest.raises(SlackApiError) as caught:
         client.call("conversations.history", channel="C0EXAMPLE1")
@@ -343,9 +343,7 @@ def test_page_limit_is_capped_at_slacks_maximum() -> None:
     assert transport.calls[0].params["limit"] == "1000"
 
 
-def _stub(handlers: dict[str, object]):  # type: ignore[no-untyped-def]
-    from tests.conftest import FakeTransport
-
+def _stub(handlers: dict[str, Any]) -> FakeTransport:
     return FakeTransport(handlers=handlers)
 
 

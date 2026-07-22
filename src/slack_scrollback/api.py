@@ -115,15 +115,19 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_RefuseRedirects)
 
 
-def urllib_transport(url: str, headers: Mapping[str, str], timeout: float) -> HttpResponse:
-    """Perform one GET with the standard library.
+def _opener_get(
+    opener: urllib.request.OpenerDirector, url: str, headers: Mapping[str, str], timeout: float
+) -> HttpResponse:
+    """One GET through ``opener``.
 
-    HTTP error statuses come back as values rather than exceptions so the retry
-    logic can treat 429 and 5xx uniformly.
+    HTTP error statuses come back as values rather than exceptions so callers
+    can treat 429, 5xx — and, under an opener that declines to follow them,
+    redirects — uniformly. Only unreachability and timeouts raise.
     """
     request = urllib.request.Request(url, headers=dict(headers), method="GET")
+    host = urllib.parse.urlsplit(url).hostname
     try:
-        with _OPENER.open(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             return HttpResponse(
                 status=response.status,
                 headers={k.lower(): v for k, v in response.headers.items()},
@@ -137,15 +141,18 @@ def urllib_transport(url: str, headers: Mapping[str, str], timeout: float) -> Ht
         )
     except urllib.error.URLError as exc:
         raise ScrollbackError(
-            f"cannot reach {SLACK_HOST}: {exc.reason} — check network connectivity and any proxy settings"
+            f"cannot reach {host}: {exc.reason} — check network connectivity and any proxy settings"
         ) from exc
     except TimeoutError as exc:
-        raise ScrollbackError(
-            f"timed out talking to {SLACK_HOST} after {timeout:g}s — retry, or raise --timeout"
-        ) from exc
+        raise ScrollbackError(f"timed out talking to {host} after {timeout:g}s — retry, or raise --timeout") from exc
 
 
-# Slack error string -> what the operator should do about it. Anything absent
+def urllib_transport(url: str, headers: Mapping[str, str], timeout: float) -> HttpResponse:
+    """Perform one GET with the standard library, refusing redirects outright."""
+    return _opener_get(_OPENER, url, headers, timeout)
+
+
+# Slack error string -> the next step that resolves it. Anything absent
 # falls back to quoting Slack's own string, which is still better than a
 # traceback and keeps unknown errors visible rather than swallowed.
 _ERROR_HELP: dict[str, str] = {

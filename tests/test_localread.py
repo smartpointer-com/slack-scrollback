@@ -249,7 +249,7 @@ def test_a_thread_reads_identically_from_both_backends(tmp_path: Path, local_zon
 def test_search_returns_the_same_messages_live_with_fts_and_without(
     query: str, from_user: str | None, expected: list[tuple[str, str]], tmp_path: Path
 ) -> None:
-    """The §-search-parity property: three code paths, one answer."""
+    """The search-parity property: three code paths, one answer."""
     fake = build_fake()
     reader, archive = synced_reader(fake, tmp_path)
     workspace = live_workspace(fake)

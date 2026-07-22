@@ -265,8 +265,8 @@ def sync_lock(directory: Path) -> Iterator[bool]:
 
     flock rather than a pid file: the kernel releases it however the process
     dies, so there is no stale-lock state to clean up. On platforms without
-    ``fcntl`` the lock degrades to a no-op — single-writer discipline is then
-    the operator's job, as the README says.
+    ``fcntl`` the lock degrades to a no-op, and nothing else keeps two
+    scheduled syncs apart.
     """
     try:
         import fcntl
@@ -464,7 +464,7 @@ class Archive:
         without triggers it is inert.
         """
         if not fts5_trigram_available():
-            self.fts_unavailable_reason = "this SQLite lacks FTS5"
+            self.fts_unavailable_reason = "this Python's SQLite lacks FTS5"
             self._con.executescript("BEGIN;\n" + _FTS_DROP_TRIGGERS + "COMMIT;")
             return
         if self._fts_exists() and self._fts_triggers_present():

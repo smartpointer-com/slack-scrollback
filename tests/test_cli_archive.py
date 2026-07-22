@@ -57,14 +57,12 @@ ARCHIVE_TRAILER = "[from local archive, synced "
 
 @pytest.fixture(autouse=True)
 def arch_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Scrub every config source and point the archive at tmp_path.
+    """Point every command in this module at a per-test archive directory.
 
-    Autouse so no test in this module can accidentally read the developer's
-    real config file, token, or archive.
+    The suite-wide fixture in conftest already scrubs the real config, token
+    and archive out of reach; this one only redirects the archive somewhere
+    each test can write and inspect.
     """
-    monkeypatch.setenv("SLACK_SCROLLBACK_CONFIG", str(tmp_path / "nonexistent.cfg"))
-    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
-    monkeypatch.delenv("SLACK_BOT_TOKEN_JSON_PATH", raising=False)
     directory = tmp_path / "arch"
     monkeypatch.setenv("SLACK_SCROLLBACK_ARCHIVE_DIR", str(directory))
     return directory
@@ -632,7 +630,7 @@ def test_a_corrupt_archive_fails_the_search_default_loudly(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], arch_dir: Path
 ) -> None:
     """The archive-if-present default must not silently fall back to live —
-    a broken archive is news the operator needs, and --live is the bypass."""
+    a broken archive is news to report, and --live is the bypass."""
     corrupt_archive(arch_dir)
     forbid_client(monkeypatch)
 

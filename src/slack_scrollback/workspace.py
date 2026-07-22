@@ -715,19 +715,27 @@ class Workspace:
         Slack's ``chat.getPermalink`` would answer this authoritatively but costs
         one request per message, which makes ``--links`` unusable over a few
         hundred messages. The URL is a pure function of workspace URL, channel and
-        timestamp, so it is composed here from a single ``auth.test`` instead —
+        timestamp, so it is composed from a single ``auth.test`` instead —
         verified to match ``chat.getPermalink`` byte-for-byte for plain messages,
         thread parents and replies.
-
-        Anything in a thread — parent included, not just replies — carries the
-        ``thread_ts``/``cid`` query that opens the thread pane.
         """
-        ts = str(message.get("ts") or "")
-        url = f"{self.team_url()}/archives/{conversation.id}/p{ts.replace('.', '')}"
-        thread_ts = message.get("thread_ts")
-        if thread_ts:
-            url = f"{url}?thread_ts={thread_ts}&cid={conversation.id}"
-        return url
+        return compose_permalink(self.team_url(), conversation.id, message)
+
+
+def compose_permalink(team_url: str, conversation_id: str, message: dict[str, Any]) -> str:
+    """One message's permalink, from the workspace URL, channel and timestamp.
+
+    Anything in a thread — parent included, not just replies — carries the
+    ``thread_ts``/``cid`` query that opens the thread pane. Both backends
+    compose through here, which is what keeps an archive-served link
+    byte-identical to a live one.
+    """
+    ts = str(message.get("ts") or "")
+    url = f"{team_url}/archives/{conversation_id}/p{ts.replace('.', '')}"
+    thread_ts = message.get("thread_ts")
+    if thread_ts:
+        url = f"{url}?thread_ts={thread_ts}&cid={conversation_id}"
+    return url
 
 
 def _ts_sort_key(ts: Any) -> tuple[int, int]:
